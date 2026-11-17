@@ -1,6 +1,11 @@
 import Cocoa
 import Security
 
+enum SigningInputSource: Int {
+    case existing
+    case file
+}
+
 /// Shared path handling for Finder drops, copied paths, and file:// URLs.
 enum SigningFilePath {
     static func normalize(_ value: String) -> String {
@@ -147,26 +152,34 @@ extension MainView {
         content.addArrangedSubview(topCards)
         topCards.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         let materials = verticalStack(spacing: 8)
-        materials.addArrangedSubview(sectionHeading("签名材料", subtitle: "支持选择文件、拖入文件或粘贴完整路径。"))
+        materials.addArrangedSubview(sectionHeading("签名材料", subtitle: "证书和描述文件各选一种来源；仅当前方式生效。"))
         BrowseButton.title = "选择应用…"
         InputFileText.placeholderString = "拖入 IPA / App，或粘贴路径 / 下载地址"
         materials.addArrangedSubview(labeledRow("应用文件", views: [InputFileText, BrowseButton]))
         CodesigningCertsPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        materials.addArrangedSubview(labeledRow("签名证书", views: [CodesigningCertsPopup]))
+        certificateSourceControl = sourceControl(labels: ["从钥匙串选择", "使用证书文件"], action: #selector(certificateSourceChanged(_:)))
+        materials.addArrangedSubview(labeledRow("签名证书", views: [certificateSourceControl!]))
+        certificateExistingRow = labeledRow("钥匙串身份", views: [CodesigningCertsPopup])
+        materials.addArrangedSubview(certificateExistingRow!)
         certificatePathField = pathField("拖入 .p12 / .pfx / .cer，或粘贴证书路径", extensions: MainView.certificateFileTypes)
         certificatePathField?.onFileDrop = { [weak self] in self?.loadCertificateFile($0) }
         let certButton = NSButton(title: "导入证书…", target: self, action: #selector(chooseCertificateFile(_:)))
         certificateBrowseButton = certButton
-        materials.addArrangedSubview(labeledRow("证书文件", views: [certificatePathField!, certButton]))
+        certificateFileRow = labeledRow("证书文件", views: [certificatePathField!, certButton])
+        materials.addArrangedSubview(certificateFileRow!)
         certificateHintLabel = uiLabel("使用钥匙串中的签名身份；导入 P12 / PFX 时需包含私钥。", size: 11, secondary: true)
         materials.addArrangedSubview(indented(certificateHintLabel!))
         ProvisioningProfilesPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        materials.addArrangedSubview(labeledRow("描述文件", views: [ProvisioningProfilesPopup]))
+        profileSourceControl = sourceControl(labels: ["已安装 / App 内嵌", "指定文件"], action: #selector(profileSourceChanged(_:)))
+        materials.addArrangedSubview(labeledRow("描述文件", views: [profileSourceControl!]))
+        profileExistingRow = labeledRow("已有配置", views: [ProvisioningProfilesPopup])
+        materials.addArrangedSubview(profileExistingRow!)
         profilePathField = pathField("拖入 .mobileprovision，或粘贴描述文件路径", extensions: ["mobileprovision"])
         profilePathField?.onFileDrop = { [weak self] in self?.loadProfileFile($0) }
         let profileButton = NSButton(title: "选择文件…", target: self, action: #selector(chooseProfileFile(_:)))
         profileBrowseButton = profileButton
-        materials.addArrangedSubview(labeledRow("文件路径", views: [profilePathField!, profileButton]))
+        profileFileRow = labeledRow("文件路径", views: [profilePathField!, profileButton])
+        materials.addArrangedSubview(profileFileRow!)
         profileDetailsLabel = uiLabel("未选择描述文件，将尝试使用应用内嵌的描述文件。", size: 11, secondary: true)
         materials.addArrangedSubview(indented(profileDetailsLabel!))
         let materialsCard = addCard(materials, to: topCards, fullWidth: false)
@@ -262,6 +275,100 @@ extension MainView {
             field?.font = .systemFont(ofSize: 12)
             field?.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
+        updateSigningInputSources()
+    }
+
+    func sourceControl(labels: [String], action: Selector) -> NSSegmentedControl {
+        let control = NSSegmentedControl(labels: labels, trackingMode: .selectOne, target: self, action: action)
+        control.selectedSegment = 0
+        control.segmentStyle = .rounded
+        control.font = .systemFont(ofSize: 11)
+        control.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        return control
+    }
+
+    @objc func certificateSourceChanged(_ sender: NSSegmentedControl) {
+        guard signingControlsEnabled, let source = SigningInputSource(rawValue: sender.selectedSegment) else { return }
+        pathEditWorkItem?.cancel()
+        certificateInputSource = source
+        window?.makeFirstResponder(nil)
+        updateSigningInputSources()
+    }
+
+    @objc func profileSourceChanged(_ sender: NSSegmentedControl) {
+        guard signingControlsEnabled, let source = SigningInputSource(rawValue: sender.selectedSegment) else { return }
+        pathEditWorkItem?.cancel()
+        profileInputSource = source
+        window?.makeFirstResponder(nil)
+        applyProfileInputSelection()
+    }
+
+    /// The inactive source is retained for switching back, but never participates in signing.
+    var currentSigningCertificate: String? {
+        if certificateInputSource == .file {
+            guard let name = importedCertificateName, codesigningCerts.contains(name) else { return nil }
+            return name
+        }
+        guard let name = CodesigningCertsPopup.titleOfSelectedItem, codesigningCerts.contains(name) else { return nil }
+        return name
+    }
+
+    var signingInputValidationMessage: String? {
+        if currentSigningCertificate == nil {
+            return certificateInputSource == .file
+                ? "当前使用证书文件：请先导入包含私钥的有效签名证书。不会使用钥匙串列表中的其他证书。"
+                : "当前从钥匙串选择：请选择可用的签名身份，或切换到“使用证书文件”。"
+        }
+        if profileInputSource == .file, selectedProvisioningProfile == nil {
+            return "当前使用描述文件：请先选择有效的 .mobileprovision 文件。不会使用已安装或 App 内嵌的描述文件。"
+        }
+        if let profile = selectedProvisioningProfile,
+           profile.expires <= Date() || !fileManager.fileExists(atPath: profile.filename) {
+            return "当前描述文件已过期或文件已不存在，请重新选择。"
+        }
+        return nil
+    }
+
+    func validateSigningInputs() -> Bool {
+        guard let message = signingInputValidationMessage else { return true }
+        showSigningFileError("请完善当前方式的签名材料", detail: message)
+        return false
+    }
+
+    func applyProfileInputSelection() {
+        let index = ProvisioningProfilesPopup.indexOfSelectedItem - 2
+        let profile = profileInputSource == .file ? importedProvisioningProfile
+            : (provisioningProfiles.indices.contains(index) ? provisioningProfiles[index] : nil)
+        checkProfileID(profile)
+        updateSigningInputSources()
+    }
+
+    func updateSigningInputSources() {
+        let certificateFile = certificateInputSource == .file
+        let profileFile = profileInputSource == .file
+        certificateSourceControl?.selectedSegment = certificateInputSource.rawValue
+        profileSourceControl?.selectedSegment = profileInputSource.rawValue
+        certificateExistingRow?.isHidden = certificateFile
+        certificateFileRow?.isHidden = !certificateFile
+        profileExistingRow?.isHidden = profileFile
+        profileFileRow?.isHidden = !profileFile
+        certificateSourceControl?.isEnabled = signingControlsEnabled
+        profileSourceControl?.isEnabled = signingControlsEnabled
+        CodesigningCertsPopup.isEnabled = signingControlsEnabled && !certificateFile
+        ProvisioningProfilesPopup.isEnabled = signingControlsEnabled && !profileFile
+        certificatePathField?.isEnabled = signingControlsEnabled && certificateFile
+        certificateBrowseButton?.isEnabled = signingControlsEnabled && certificateFile
+        profilePathField?.isEnabled = signingControlsEnabled && profileFile
+        profileBrowseButton?.isEnabled = signingControlsEnabled && profileFile
+        certificateHintLabel?.textColor = currentSigningCertificate == nil ? .systemOrange : .secondaryLabelColor
+        if certificateFile {
+            certificateHintLabel?.stringValue = currentSigningCertificate.map { "当前生效 · 文件证书：\($0)" }
+                ?? "仅使用此处导入的证书；请导入包含私钥的 P12 / PFX。"
+        } else {
+            certificateHintLabel?.stringValue = currentSigningCertificate.map { "当前生效 · 钥匙串身份：\($0)" }
+                ?? "钥匙串中没有可用签名身份，可切换到“使用证书文件”。"
+        }
+        updateProfileDetails()
     }
 
     func uiLabel(_ text: String, size: CGFloat = 12, weight: NSFont.Weight = .regular, secondary: Bool = false) -> NSTextField {
@@ -369,34 +476,41 @@ extension MainView {
     }
 
     func loadProfileFile(_ value: String) {
-        guard StartButton.isEnabled else { return }
+        guard signingControlsEnabled else { return }
         let path = SigningFilePath.normalize(value)
         guard path.pathExtension.lowercased() == "mobileprovision", fileManager.fileExists(atPath: path),
               let profile = ProvisioningProfile(filename: path) else {
             showSigningFileError("无法读取描述文件", detail: "请选择有效的 .mobileprovision 文件。\n\(path)")
-            profilePathField?.stringValue = profileFilename ?? ""
+            profilePathField?.stringValue = importedProvisioningProfile?.filename ?? ""
             return
         }
         guard profile.expires > Date() else {
             showSigningFileError("描述文件已过期", detail: "\(profile.name)\n请选择仍在有效期内的描述文件。")
-            profilePathField?.stringValue = profileFilename ?? ""
+            profilePathField?.stringValue = importedProvisioningProfile?.filename ?? ""
             return
         }
-        ProvisioningProfilesPopup.selectItem(at: 1)
-        checkProfileID(profile)
+        importedProvisioningProfile = profile
+        profileInputSource = .file
+        applyProfileInputSelection()
     }
 
     func updateProfileDetails() {
         let profile = selectedProvisioningProfile
-        profilePathField?.stringValue = profile?.filename ?? ""
-        profilePathField?.toolTip = profile?.filename
+        profilePathField?.stringValue = importedProvisioningProfile?.filename ?? ""
+        profilePathField?.toolTip = importedProvisioningProfile?.filename
         guard let profile else {
-            profileDetailsLabel?.stringValue = "未选择描述文件，将尝试使用应用内嵌的描述文件。"
+            profileDetailsLabel?.stringValue = profileInputSource == .file
+                ? "尚未选择文件；不会使用已安装或 App 内嵌的描述文件。"
+                : "当前生效 · App 内嵌描述文件（未内嵌时不使用描述文件）。"
+            profileDetailsLabel?.textColor = profileInputSource == .file ? .systemOrange : .secondaryLabelColor
+            profileDetailsLabel?.toolTip = nil
             return
         }
         let date = DateFormatter()
         date.dateStyle = .medium
-        profileDetailsLabel?.stringValue = "\(profile.name)  ·  Team ID: \(profile.teamID)  ·  有效期至 \(date.string(from: profile.expires))"
+        let source = profileInputSource == .file ? "指定文件" : "已安装配置"
+        profileDetailsLabel?.stringValue = "当前生效 · \(source)：\(profile.name)  ·  Team ID: \(profile.teamID)  ·  有效期至 \(date.string(from: profile.expires))"
+        profileDetailsLabel?.textColor = .secondaryLabelColor
         profileDetailsLabel?.toolTip = "Bundle ID: \(profile.appID)\n\(profile.filename)"
     }
 
@@ -444,33 +558,32 @@ extension MainView {
             certificatePathField?.stringValue = certificateFilePath ?? ""
             return
         }
-        let names = result.names
+        finishCertificateImport(path: path, names: result.names)
+    }
+
+    func finishCertificateImport(path: String, names: [String]) {
         let previous = CodesigningCertsPopup.titleOfSelectedItem
         populateCodesigningCerts()
+        if let previous { CodesigningCertsPopup.selectItem(withTitle: previous) }
         certificateFilePath = path
+        certificateInputSource = .file
+        importedCertificateName = names.first(where: { codesigningCerts.contains($0) })
         certificatePathField?.stringValue = path
         certificatePathField?.toolTip = path
-        if let match = names.first(where: { codesigningCerts.contains($0) }) {
-            CodesigningCertsPopup.selectItem(withTitle: match)
-            chooseSigningCertificate(CodesigningCertsPopup)
-            certificateHintLabel?.stringValue = "已导入并选择：\(match)"
-            certificateHintLabel?.textColor = .secondaryLabelColor
+        updateSigningInputSources()
+        if let match = importedCertificateName {
             setStatus("已导入签名证书：\(match)")
         } else {
-            if let previous { CodesigningCertsPopup.selectItem(withTitle: previous) }
             certificateHintLabel?.stringValue = "文件已导入，但未找到对应的有效签名身份。签名需要匹配的私钥；请导入包含私钥的 P12 / PFX。"
-            certificateHintLabel?.textColor = .systemOrange
             setStatus("证书已导入，请检查是否包含有效签名身份")
         }
     }
 
     func setSigningInputControlsEnabled(_ enabled: Bool) {
-        profilePathField?.isEnabled = enabled
-        certificatePathField?.isEnabled = enabled
-        profileBrowseButton?.isEnabled = enabled
-        certificateBrowseButton?.isEnabled = enabled
+        updateSigningInputSources()
         entitlementFilePathLabel?.isEnabled = enabled
-        entitlementSourcePopup?.isEnabled = enabled
+        appGroupsSourcePopup?.isEnabled = enabled
+        keychainGroupsSourcePopup?.isEnabled = enabled
         finalAppGroupsField?.isEnabled = enabled
         finalKeychainGroupsField?.isEnabled = enabled
         chooseEntitlementsFileButton?.isEnabled = enabled
@@ -483,6 +596,8 @@ extension MainView {
 
     func acceptPathEdit(_ field: NSTextField, reportError: Bool) {
         guard signingControlsEnabled else { return }
+        guard field !== profilePathField || profileInputSource == .file,
+              field !== certificatePathField || certificateInputSource == .file else { return }
         let path = SigningFilePath.normalize(field.stringValue)
         guard !path.isEmpty else {
             if field === profilePathField { updateProfileDetails() }
@@ -493,7 +608,7 @@ extension MainView {
            !pathField.allowedExtensions.contains(path.pathExtension.lowercased()) { return }
         let exists = fileManager.fileExists(atPath: path)
         if field === profilePathField {
-            if path == profileFilename { field.stringValue = path; return }
+            if path == importedProvisioningProfile?.filename { field.stringValue = path; return }
             if exists || reportError { loadProfileFile(path) }
         } else if field === certificatePathField {
             if path == certificateFilePath { field.stringValue = path; return }
@@ -507,10 +622,7 @@ extension MainView {
                 return
             }
             guard path != entitlementFilePath else { return }
-            entitlementFilePath = path
-            finalEntitlementSource = .entitlementsFile
-            finalEntitlementsUserEdited = true
-            scheduleEntitlementInspection()
+            selectEntitlementsFile(path)
         }
     }
 }

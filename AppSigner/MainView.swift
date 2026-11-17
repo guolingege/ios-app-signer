@@ -16,12 +16,15 @@ enum EntitlementSnapshotStatus {
 }
 
 struct EntitlementSnapshot {
-    let sourceName: String
+    var sourceName: String
     let appGroups: [String]
     let keychainGroups: [String]
     let applicationIdentifier: String?
     let teamID: String?
     let status: EntitlementSnapshotStatus
+    var sourcePath: String? = nil
+    var sourceDescription: String? = nil
+    var isAuthorizationScope = false
 
     var isAvailable: Bool {
         if case .available = status { return true }
@@ -41,23 +44,39 @@ struct EntitlementSnapshot {
 }
 
 enum FinalEntitlementSource: Int, CaseIterable {
-    case provisioningProfile
-    case originalApp
-    case entitlementsFile
-    case custom
+    case provisioningProfile = 0
+    case originalApp = 1
+    case embeddedProfile = 4
+    case entitlementsFile = 2
+    case custom = 3
 
     var title: String {
         switch self {
         case .provisioningProfile:
-            return "描述文件（推荐）"
+            return "本次签名描述文件"
         case .originalApp:
-            return "原 App 签名"
+            return "Mach-O 签名权限"
         case .entitlementsFile:
             return "Entitlements 文件"
         case .custom:
             return "自定义"
+        case .embeddedProfile:
+            return "App 内嵌描述文件"
         }
     }
+}
+
+enum AccessGroupKind: Int, CaseIterable {
+    case appGroups
+    case keychainGroups
+
+    var title: String { self == .appGroups ? "App Groups" : "钥匙串访问组" }
+}
+
+struct FinalGroupSelection {
+    var source: FinalEntitlementSource = .provisioningProfile
+    var userEdited = false
+    var customValue: String?
 }
 
 class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDownloadDelegate, NSTextFieldDelegate {
@@ -84,15 +103,26 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     var inspectedOriginalEntitlements: EntitlementSnapshot?
     var inspectedEntitlementsFile: EntitlementSnapshot?
     var inspectedEmbeddedProfile: ProvisioningProfile?
+    var inspectedEmbeddedEntitlements: EntitlementSnapshot?
     var entitlementFilePath: String?
-    var finalEntitlementSource: FinalEntitlementSource = .provisioningProfile
-    var finalEntitlementsUserEdited = false
+    var finalAppGroupsSelection = FinalGroupSelection()
+    var finalKeychainGroupsSelection = FinalGroupSelection()
     var entitlementInspectorConfigured = false
     var entitlementInspectionGeneration = 0
 
     var profilePathField: SigningPathField?
     var certificatePathField: SigningPathField?
     var certificateFilePath: String?
+    var certificateInputSource: SigningInputSource = .existing
+    var profileInputSource: SigningInputSource = .existing
+    var importedCertificateName: String?
+    var importedProvisioningProfile: ProvisioningProfile?
+    var certificateSourceControl: NSSegmentedControl?
+    var profileSourceControl: NSSegmentedControl?
+    var certificateExistingRow: NSView?
+    var certificateFileRow: NSView?
+    var profileExistingRow: NSView?
+    var profileFileRow: NSView?
     var profileBrowseButton: NSButton?
     var certificateBrowseButton: NSButton?
     var profileDetailsLabel: NSTextField?
@@ -105,7 +135,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     var entitlementContentStack: NSStackView?
     var entitlementWarningLabel: NSTextField?
     var entitlementFilePathLabel: NSTextField?
-    var entitlementSourcePopup: NSPopUpButton?
+    var appGroupsSourcePopup: NSPopUpButton?
+    var keychainGroupsSourcePopup: NSPopUpButton?
     var finalAppGroupsField: NSTextField?
     var finalKeychainGroupsField: NSTextField?
     var chooseEntitlementsFileButton: NSButton?
@@ -157,10 +188,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         case let ext where MainView.certificateFileTypes.contains(ext):
             loadCertificateFile(filename)
         case let ext where MainView.entitlementsFileTypes.contains(ext):
-            entitlementFilePath = filename
-            finalEntitlementSource = .entitlementsFile
-            finalEntitlementsUserEdited = true
-            scheduleEntitlementInspection()
+            selectEntitlementsFile(filename)
         default:
             break
         }
@@ -262,6 +290,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                     CodesigningCertsPopup.selectItem(withTitle: defaultCert)
                 }
             }
+            updateSigningInputSources()
             setStatus("就绪")
             if checkXcodeCLI() == false {
                 if #available(OSX 10.10, *) {
@@ -274,7 +303,6 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                 
                 NSApplication.shared.terminate(self)
             }
-            UpdatesController.checkForUpdate()
         }
     }
     
@@ -342,26 +370,25 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
         ])
         entitlementContentStack = stack
-        stack.addArrangedSubview(sectionHeading("权限对比", subtitle: "红色表示与描述文件不同；组值可选中复制，较多时可在单元格内滚动查看。"))
+        stack.addArrangedSubview(sectionHeading("权限对比", subtitle: "橙色表示授权范围不同，或值不同但仍获授权；红色表示存在未授权值。组值可选中复制。"))
         stack.addArrangedSubview(makeEntitlementsFilePickerRow())
 
-        let profile = selectedProfileSnapshot()
+        let baseline = entitlementComparisonReference()
+        let profile = baseline?.snapshot
         let referenceTeam = profile?.teamID ?? inspectedOriginalEntitlements?.teamID ?? inspectedEntitlementsFile?.teamID
         let table = verticalStack(spacing: 0)
         table.addArrangedSubview(makeEntitlementTableRow(
             values: ["权限来源", "App Groups", "Keychain Access Groups", "对比状态"],
             colors: Array(repeating: .secondaryLabelColor, count: 4), bold: true, unavailable: false))
-        for (title, snapshot) in [
-            ("原 App 签名", inspectedOriginalEntitlements),
-            ("权限文件", inspectedEntitlementsFile),
-            (selectedProvisioningProfile == nil && inspectedEmbeddedProfile != nil ? "内嵌描述文件" : "所选描述文件", profile)
-        ] {
+        for source in [FinalEntitlementSource.originalApp, .embeddedProfile, .provisioningProfile, .entitlementsFile] {
             let separator = NSBox()
             separator.boxType = .separator
             table.addArrangedSubview(separator)
-            table.addArrangedSubview(makeSnapshotRow(title: title, snapshot: snapshot, reference: profile, teamID: referenceTeam))
+            table.addArrangedSubview(makeSnapshotRow(title: source.title, snapshot: snapshot(for: source),
+                reference: profile, teamID: referenceTeam, isReference: source == baseline?.source))
         }
         stack.addArrangedSubview(table)
+        stack.addArrangedSubview(uiLabel("Mach-O：签名中声明的实际权限；描述文件：授权范围（可能含 *）。优先对照本次签名描述文件，否则对照 App 内嵌描述文件。此处不验证签名有效性。", size: 11, secondary: true))
         for row in table.arrangedSubviews { constrainInspectorRow(row, to: table) }
 
         let warning = uiLabel("", size: 11, weight: .medium)
@@ -371,47 +398,15 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         let separator = NSBox()
         separator.boxType = .separator
         stack.addArrangedSubview(separator)
-        stack.addArrangedSubview(sectionHeading("最终签名值", subtitle: "选择来源后可直接编辑。多个组用英文逗号分隔，留空表示不设置该项。"))
-
-        // Do not change the user's source while its inspection is in flight.
-        if finalEntitlementSource == .custom && !finalEntitlementsUserEdited {
-            finalEntitlementSource = defaultFinalEntitlementSource()
-        }
-        let selectedSnapshot: EntitlementSnapshot?
-        switch finalEntitlementSource {
-        case .originalApp: selectedSnapshot = inspectedOriginalEntitlements
-        case .entitlementsFile: selectedSnapshot = inspectedEntitlementsFile
-        case .provisioningProfile: selectedSnapshot = profile
-        case .custom: selectedSnapshot = nil
-        }
-        let isLoading: Bool
-        if case .loading? = selectedSnapshot?.status { isLoading = true } else { isLoading = false }
-        if !isLoading, finalEntitlementSource != .custom, valuesForFinalSource(finalEntitlementSource) == nil {
-            finalEntitlementSource = defaultFinalEntitlementSource()
-        }
-        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
-        popup.autoenablesItems = false
-        popup.target = self
-        popup.action = #selector(entitlementSourceChanged(_:))
-        for source in FinalEntitlementSource.allCases {
-            popup.addItem(withTitle: source.title)
-            popup.lastItem?.tag = source.rawValue
-            popup.lastItem?.isEnabled = source == .custom || valuesForFinalSource(source) != nil
-        }
-        popup.selectItem(withTag: finalEntitlementSource.rawValue)
-        entitlementSourcePopup = popup
-        stack.addArrangedSubview(labeledRow("使用来源", views: [popup]))
-        let values = finalEntitlementSource == .custom || isLoading
-            ? (appGroups: splitGroupList(previousAppGroups ?? ""), keychainGroups: splitGroupList(previousKeychainGroups ?? ""))
-            : valuesForFinalSource(finalEntitlementSource) ?? ([], [])
-        finalAppGroupsField = makeFinalGroupsField(title: "App Groups", text: values.appGroups.joined(separator: ", "), placeholder: "例如 group.com.example.app")
-        finalKeychainGroupsField = makeFinalGroupsField(title: "Keychain Groups", text: values.keychainGroups.joined(separator: ", "), placeholder: "例如 TEAMID.com.example.shared")
+        stack.addArrangedSubview(sectionHeading("最终签名值", subtitle: "两类组独立选择来源；编辑只将对应项改为自定义。其他权限优先沿用描述文件。"))
+        stack.addArrangedSubview(makeFinalGroupsRow(kind: .appGroups, previousValue: previousAppGroups))
+        stack.addArrangedSubview(makeFinalGroupsRow(kind: .keychainGroups, previousValue: previousKeychainGroups))
         for row in stack.arrangedSubviews { constrainInspectorRow(row, to: stack) }
         updateEntitlementWarning()
         setSigningInputControlsEnabled(signingControlsEnabled)
     }
 
-    func makeSnapshotRow(title: String, snapshot: EntitlementSnapshot?, reference: EntitlementSnapshot?, teamID: String?) -> NSStackView {
+    func makeSnapshotRow(title: String, snapshot: EntitlementSnapshot?, reference: EntitlementSnapshot?, teamID: String?, isReference: Bool = false) -> NSStackView {
         guard let snapshot else {
             return makeEntitlementTableRow(values: [title, "—", "—", "未选择"], colors: [.labelColor, .tertiaryLabelColor, .tertiaryLabelColor, .secondaryLabelColor], bold: false, unavailable: true)
         }
@@ -422,28 +417,48 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         let appGroups = expandedGroups(snapshot.appGroups, teamID: snapshot.teamID ?? teamID)
         let keychainGroups = expandedGroups(snapshot.keychainGroups, teamID: snapshot.teamID ?? teamID)
         if snapshot.isAvailable {
-            if title == "所选描述文件" || title == "内嵌描述文件" {
+            if isReference {
                 result = "比较基准"
                 color = .controlAccentColor
             } else if let reference, reference.isAvailable {
-                let appMatches = setsEqual(appGroups, expandedGroups(reference.appGroups, teamID: reference.teamID))
-                let keychainMatches = setsEqual(keychainGroups, expandedGroups(reference.keychainGroups, teamID: reference.teamID))
-                appColor = appMatches ? .labelColor : .systemRed
-                keychainColor = keychainMatches ? .labelColor : .systemRed
-                result = appMatches && keychainMatches ? "✓ 一致" : "⚠ 存在差异"
-                color = appMatches && keychainMatches ? .systemGreen : .systemRed
+                let allowedApp = expandedGroups(reference.appGroups, teamID: reference.teamID)
+                let allowedKeychain = expandedGroups(reference.keychainGroups, teamID: reference.teamID)
+                let appMatches = setsEqual(appGroups, allowedApp)
+                let keychainMatches = setsEqual(keychainGroups, allowedKeychain)
+                let appAllowed = groupsAreAuthorized(appGroups, by: allowedApp)
+                let keychainAllowed = groupsAreAuthorized(keychainGroups, by: allowedKeychain)
+                appColor = appMatches ? .labelColor : (snapshot.isAuthorizationScope || appAllowed ? .systemOrange : .systemRed)
+                keychainColor = keychainMatches ? .labelColor : (snapshot.isAuthorizationScope || keychainAllowed ? .systemOrange : .systemRed)
+                if appMatches && keychainMatches {
+                    result = "✓ 一致"
+                    color = .systemGreen
+                } else if snapshot.isAuthorizationScope {
+                    result = "授权范围不同"
+                    color = .systemOrange
+                } else if appAllowed && keychainAllowed {
+                    result = "值不同 · 已授权"
+                    color = .systemOrange
+                } else {
+                    result = "⚠ 存在未授权值"
+                    color = .systemRed
+                }
             } else {
                 result = "等待比较基准"
             }
         }
         let row = makeEntitlementTableRow(
             values: [title, snapshot.isAvailable ? formattedGroups(appGroups) : "—", snapshot.isAvailable ? formattedGroups(keychainGroups) : "—", result],
-            colors: [.labelColor, appColor, keychainColor, color], bold: false, unavailable: !snapshot.isAvailable)
-        row.toolTip = "\(snapshot.sourceName)\nTeam ID: \(snapshot.teamID ?? "未知")\nApplication ID: \(snapshot.applicationIdentifier ?? "未知")\n\(snapshot.statusText)"
+            colors: [.labelColor, appColor, keychainColor, color], bold: false, unavailable: !snapshot.isAvailable,
+            sourceDetail: snapshot.sourceDescription, sourcePath: snapshot.sourcePath)
+        row.toolTip = "\(snapshot.sourceName)\n\(snapshot.sourcePath ?? "")\nTeam ID: \(snapshot.teamID ?? "未知")\nApplication ID: \(snapshot.applicationIdentifier ?? "未知")\n\(snapshot.statusText)"
         return row
     }
 
-    func makeEntitlementTableRow(values: [String], colors: [NSColor], bold: Bool, unavailable: Bool) -> NSStackView {
+    func groupsAreAuthorized(_ values: [String], by allowed: [String]) -> Bool {
+        values.allSatisfy { group in allowed.contains { entitlementGroup(group, isAllowedBy: $0) } }
+    }
+
+    func makeEntitlementTableRow(values: [String], colors: [NSColor], bold: Bool, unavailable: Bool, sourceDetail: String? = nil, sourcePath: String? = nil) -> NSStackView {
         let row = horizontalStack(spacing: 14)
         row.alignment = .top
         row.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
@@ -451,7 +466,20 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         let proportions: [CGFloat] = [0.17, 0.31, 0.35, 0.17]
         for (index, value) in values.enumerated() {
             let cell: NSView
-            if !bold && (index == 1 || index == 2) && value != "—" && value != "未设置" {
+            if !bold && index == 0, let sourceDetail {
+                let column = verticalStack(spacing: 4)
+                let title = uiLabel(value, size: 12, weight: .medium)
+                title.maximumNumberOfLines = 0
+                column.addArrangedSubview(title)
+                let detail = uiLabel(sourceDetail, size: 10, secondary: true)
+                detail.maximumNumberOfLines = 3
+                detail.lineBreakMode = .byTruncatingMiddle
+                detail.isSelectable = true
+                detail.toolTip = sourcePath
+                column.addArrangedSubview(detail)
+                for label in column.arrangedSubviews { label.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true }
+                cell = column
+            } else if !bold && (index == 1 || index == 2) && value != "—" && value != "未设置" {
                 cell = makeScrollableGroupCell(value, color: colors[index], proportion: proportions[index])
             } else {
                 let label = uiLabel(value, size: bold ? 11 : 12, weight: bold || index == 3 ? .medium : .regular)
@@ -515,20 +543,95 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         return labeledRow("权限文件", views: [path, choose, clear])
     }
 
-    func makeFinalGroupsField(title: String, text: String, placeholder: String) -> NSTextField {
+    func groupSelection(for kind: AccessGroupKind) -> FinalGroupSelection {
+        kind == .appGroups ? finalAppGroupsSelection : finalKeychainGroupsSelection
+    }
+
+    func setGroupSelection(_ selection: FinalGroupSelection, for kind: AccessGroupKind) {
+        if kind == .appGroups { finalAppGroupsSelection = selection }
+        else { finalKeychainGroupsSelection = selection }
+    }
+
+    func snapshot(for source: FinalEntitlementSource) -> EntitlementSnapshot? {
+        switch source {
+        case .provisioningProfile: return selectedProfileSnapshot()
+        case .embeddedProfile: return embeddedProfileSnapshot()
+        case .originalApp: return inspectedOriginalEntitlements
+        case .entitlementsFile: return inspectedEntitlementsFile
+        case .custom: return nil
+        }
+    }
+
+    func makeFinalGroupsRow(kind: AccessGroupKind, previousValue: String?) -> NSStackView {
+        var selection = groupSelection(for: kind)
+        if selection.source == .custom, !selection.userEdited {
+            selection.source = defaultFinalEntitlementSource()
+        }
+        // A pending inspection must not change this row's selection or erase its values.
+        let isLoading: Bool
+        if case .loading? = snapshot(for: selection.source)?.status { isLoading = true }
+        else { isLoading = false }
+        if !isLoading, selection.source != .custom, valuesForFinalSource(selection.source) == nil {
+            selection.source = defaultFinalEntitlementSource()
+        }
+        setGroupSelection(selection, for: kind)
+
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        popup.translatesAutoresizingMaskIntoConstraints = false
+        popup.autoenablesItems = false
+        popup.tag = kind.rawValue
+        popup.target = self
+        popup.action = #selector(groupSourceChanged(_:))
+        popup.setAccessibilityLabel("\(kind.title) 的最终来源")
+        for source in FinalEntitlementSource.allCases {
+            popup.addItem(withTitle: source.title)
+            popup.lastItem?.tag = source.rawValue
+            popup.lastItem?.isEnabled = source == .custom || valuesForFinalSource(source) != nil
+            if let snapshot = snapshot(for: source) {
+                popup.lastItem?.toolTip = [snapshot.sourceDescription, snapshot.sourcePath].compactMap { $0 }.joined(separator: "\n")
+            }
+        }
+        popup.selectItem(withTag: selection.source.rawValue)
+        popup.widthAnchor.constraint(equalToConstant: 180).isActive = true
+
+        let text: String
+        if selection.source == .custom { text = selection.customValue ?? previousValue ?? "" }
+        else if isLoading { text = previousValue ?? "" }
+        else if let values = valuesForFinalSource(selection.source) {
+            text = (kind == .appGroups ? values.appGroups : values.keychainGroups).joined(separator: ", ")
+        } else { text = "" }
         let field = NSTextField(string: text)
         field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        field.placeholderString = placeholder
+        field.placeholderString = kind == .appGroups ? "例如 group.com.example.app" : "例如 TEAMID.com.example.shared"
+        field.setAccessibilityLabel("\(kind.title) 的最终签名值")
+        field.toolTip = "多个组用英文逗号分隔；留空表示不设置该项。手动编辑只更改此项的来源。"
         field.delegate = self
-        let label = uiLabel(title, size: 11, secondary: true)
-        label.widthAnchor.constraint(equalToConstant: 116).isActive = true
-        let row = horizontalStack(views: [label, field], spacing: 10)
         field.translatesAutoresizingMaskIntoConstraints = false
         field.setContentHuggingPriority(.defaultLow, for: .horizontal)
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        // Retain the row until it is added to the inspector stack.
-        entitlementContentStack?.addArrangedSubview(row)
-        return field
+        let label = uiLabel(kind.title, size: 11, secondary: true)
+        label.widthAnchor.constraint(equalToConstant: 116).isActive = true
+        if kind == .appGroups {
+            appGroupsSourcePopup = popup
+            finalAppGroupsField = field
+        } else {
+            keychainGroupsSourcePopup = popup
+            finalKeychainGroupsField = field
+        }
+        return horizontalStack(views: [label, popup, field], spacing: 10)
+    }
+
+    /// Attaching a permission file makes it available to both rows, without replacing explicit choices.
+    func selectEntitlementsFile(_ path: String) {
+        entitlementFilePath = path
+        for kind in AccessGroupKind.allCases {
+            var selection = groupSelection(for: kind)
+            if !selection.userEdited {
+                selection.source = .entitlementsFile
+                setGroupSelection(selection, for: kind)
+            }
+        }
+        scheduleEntitlementInspection()
     }
 
     @objc func chooseEntitlementsFile(_ sender: Any?) {
@@ -540,37 +643,49 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         openDialog.allowedFileTypes = MainView.entitlementsFileTypes
         openDialog.runModal()
         if let filename = openDialog.urls.first {
-            entitlementFilePath = filename.path
-            finalEntitlementSource = .entitlementsFile
-            finalEntitlementsUserEdited = true
-            scheduleEntitlementInspection()
+            selectEntitlementsFile(filename.path)
         }
     }
 
     @objc func clearEntitlementsFile(_ sender: Any?) {
         entitlementFilePath = nil
         inspectedEntitlementsFile = nil
-        if finalEntitlementSource == .entitlementsFile {
-            finalEntitlementSource = defaultFinalEntitlementSource()
+        for kind in AccessGroupKind.allCases {
+            var selection = groupSelection(for: kind)
+            if selection.source == .entitlementsFile {
+                selection.source = defaultFinalEntitlementSource()
+                setGroupSelection(selection, for: kind)
+            }
         }
         scheduleEntitlementInspection()
     }
 
-    @objc func entitlementSourceChanged(_ sender: NSPopUpButton) {
-        guard let source = FinalEntitlementSource(rawValue: sender.selectedTag()) else {
-            return
+    @objc func groupSourceChanged(_ sender: NSPopUpButton) {
+        guard signingControlsEnabled,
+              let kind = AccessGroupKind(rawValue: sender.tag),
+              let source = FinalEntitlementSource(rawValue: sender.selectedTag()) else { return }
+        var selection = groupSelection(for: kind)
+        if source == .custom, selection.customValue == nil {
+            selection.customValue = (kind == .appGroups ? finalAppGroupsField : finalKeychainGroupsField)?.stringValue ?? ""
         }
-        finalEntitlementSource = source
-        finalEntitlementsUserEdited = true
+        selection.source = source
+        selection.userEdited = true
+        setGroupSelection(selection, for: kind)
         rebuildEntitlementInspectorContent()
     }
 
     func controlTextDidChange(_ obj: Notification) {
         guard let field = obj.object as? NSTextField else { return }
         if field === finalAppGroupsField || field === finalKeychainGroupsField {
-            finalEntitlementSource = .custom
-            finalEntitlementsUserEdited = true
-            entitlementSourcePopup?.selectItem(withTag: FinalEntitlementSource.custom.rawValue)
+            guard signingControlsEnabled else { return }
+            let kind: AccessGroupKind = field === finalAppGroupsField ? .appGroups : .keychainGroups
+            var selection = groupSelection(for: kind)
+            selection.source = .custom
+            selection.userEdited = true
+            selection.customValue = field.stringValue
+            setGroupSelection(selection, for: kind)
+            let popup = kind == .appGroups ? appGroupsSourcePopup : keychainGroupsSourcePopup
+            popup?.selectItem(withTag: FinalEntitlementSource.custom.rawValue)
             updateEntitlementWarning()
         } else if field === profilePathField || field === certificatePathField || field === entitlementFilePathLabel {
             pathEditWorkItem?.cancel()
@@ -597,11 +712,25 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
 
     func selectedProfileSnapshot() -> EntitlementSnapshot? {
         if let profile = selectedProvisioningProfile {
-            return snapshot(from: profile, sourceName: "所选描述文件")
+            return snapshot(from: profile, sourceName: "本次签名描述文件")
         }
-        if let profile = inspectedEmbeddedProfile {
-            return snapshot(from: profile, sourceName: "App 内嵌描述文件")
+        if profileInputSource == .existing, selectedProvisioningProfile == nil {
+            guard var embedded = embeddedProfileSnapshot() else { return nil }
+            embedded.sourceName = "本次签名描述文件"
+            embedded.sourceDescription = "使用 App 内嵌描述文件\nEntitlements 授权范围"
+            return embedded
         }
+        return nil
+    }
+
+    func embeddedProfileSnapshot() -> EntitlementSnapshot? {
+        if let snapshot = inspectedEmbeddedEntitlements { return snapshot }
+        return inspectedEmbeddedProfile.map { snapshot(from: $0, sourceName: "App 内嵌描述文件") }
+    }
+
+    func entitlementComparisonReference() -> (source: FinalEntitlementSource, snapshot: EntitlementSnapshot)? {
+        if let snapshot = selectedProfileSnapshot(), snapshot.isAvailable { return (.provisioningProfile, snapshot) }
+        if let snapshot = embeddedProfileSnapshot(), snapshot.isAvailable { return (.embeddedProfile, snapshot) }
         return nil
     }
 
@@ -612,7 +741,10 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             keychainGroups: groups(named: "keychain-access-groups", in: profile.entitlements),
             applicationIdentifier: profile.entitlements["application-identifier"] as? String,
             teamID: profile.teamID,
-            status: .available
+            status: .available,
+            sourcePath: profile.filename,
+            sourceDescription: "Entitlements 授权范围\n\(profile.filename.lastPathComponent)",
+            isAuthorizationScope: true
         )
     }
 
@@ -673,22 +805,13 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
 
     func valuesForFinalSource(_ source: FinalEntitlementSource) -> (appGroups: [String], keychainGroups: [String])? {
         let teamID = selectedProfileSnapshot()?.teamID ?? inspectedOriginalEntitlements?.teamID ?? inspectedEntitlementsFile?.teamID
-        let snapshot: EntitlementSnapshot?
-        switch source {
-        case .provisioningProfile:
-            snapshot = selectedProfileSnapshot()
-        case .originalApp:
-            snapshot = inspectedOriginalEntitlements
-        case .entitlementsFile:
-            snapshot = inspectedEntitlementsFile
-        case .custom:
-            return (currentFinalAppGroups(), currentFinalKeychainGroups())
-        }
+        if source == .custom { return (currentFinalAppGroups(), currentFinalKeychainGroups()) }
+        let snapshot = snapshot(for: source)
 
         guard let snapshot, snapshot.isAvailable else { return nil }
         return (
-            expandedGroups(snapshot.appGroups, teamID: teamID),
-            expandedGroups(snapshot.keychainGroups, teamID: teamID)
+            expandedGroups(snapshot.appGroups, teamID: snapshot.teamID ?? teamID),
+            expandedGroups(snapshot.keychainGroups, teamID: snapshot.teamID ?? teamID)
         )
     }
 
@@ -708,49 +831,61 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     func updateEntitlementWarning() {
         guard let label = entitlementWarningLabel else { return }
         let profile = selectedProfileSnapshot()
-        let snapshots = [inspectedOriginalEntitlements, inspectedEntitlementsFile].compactMap { $0 }
+        let snapshots = [inspectedOriginalEntitlements, embeddedProfileSnapshot(), inspectedEntitlementsFile].compactMap { $0 }
         if snapshots.contains(where: { if case .loading = $0.status { return true }; return false }) {
-            label.stringValue = "正在读取权限信息，请稍候…"
+            label.stringValue = "正在读取 Mach-O 签名权限与描述文件，请稍候…"
             label.textColor = .secondaryLabelColor
             return
         }
         var warnings: [String] = []
-        if let profile {
+        var unauthorized = false
+        if let profile, profile.isAvailable {
             let allowedApp = expandedGroups(profile.appGroups, teamID: profile.teamID)
             let allowedKeychain = expandedGroups(profile.keychainGroups, teamID: profile.teamID)
             for snapshot in snapshots where snapshot.isAvailable {
-                let name = snapshot.sourceName.contains("Mach-O") ? "原 App" : "权限文件"
+                let app = expandedGroups(snapshot.appGroups, teamID: snapshot.teamID ?? profile.teamID)
+                let keychain = expandedGroups(snapshot.keychainGroups, teamID: snapshot.teamID ?? profile.teamID)
                 var differing: [String] = []
-                if !setsEqual(expandedGroups(snapshot.appGroups, teamID: snapshot.teamID ?? profile.teamID), allowedApp) { differing.append("App Groups") }
-                if !setsEqual(expandedGroups(snapshot.keychainGroups, teamID: snapshot.teamID ?? profile.teamID), allowedKeychain) { differing.append("钥匙串访问组") }
-                if !differing.isEmpty { warnings.append("\(name)与描述文件的\(differing.joined(separator: "、"))不同") }
+                if !setsEqual(app, allowedApp) { differing.append("App Groups") }
+                if !setsEqual(keychain, allowedKeychain) { differing.append("钥匙串访问组") }
+                if !differing.isEmpty {
+                    let isAllowed = groupsAreAuthorized(app, by: allowedApp) && groupsAreAuthorized(keychain, by: allowedKeychain)
+                    let suffix = snapshot.isAuthorizationScope ? "授权范围不同" : (isAllowed ? "值不同，但在授权范围内" : "包含未授权值")
+                    warnings.append("\(snapshot.sourceName)的\(differing.joined(separator: "、"))：\(suffix)（对照本次签名描述文件）")
+                    unauthorized = unauthorized || (!snapshot.isAuthorizationScope && !isAllowed)
+                }
             }
             let finalApp = expandedGroups(currentFinalAppGroups(), teamID: profile.teamID)
             let finalKeychain = expandedGroups(currentFinalKeychainGroups(), teamID: profile.teamID)
-            if !finalApp.allSatisfy({ group in allowedApp.contains(where: { entitlementGroup(group, isAllowedBy: $0) }) }) {
-                warnings.append("最终 App Groups 包含描述文件未授权的值")
+            if !groupsAreAuthorized(finalApp, by: allowedApp) {
+                warnings.append("最终 App Groups 包含本次签名描述文件未授权的值")
+                unauthorized = true
             }
-            if !finalKeychain.allSatisfy({ group in allowedKeychain.contains(where: { entitlementGroup(group, isAllowedBy: $0) }) }) {
-                warnings.append("最终钥匙串访问组包含描述文件未授权的值")
+            if !groupsAreAuthorized(finalKeychain, by: allowedKeychain) {
+                warnings.append("最终钥匙串访问组包含本次签名描述文件未授权的值")
+                unauthorized = true
             }
+        }
+        if (currentFinalAppGroups() + currentFinalKeychainGroups()).contains(where: { $0.contains("*") }) {
+            warnings.append("最终组值含 *；描述文件中的通配授权范围不等于应用的实际组名，请选择 Mach-O 或填写具体组名")
         }
         if !warnings.isEmpty {
             label.stringValue = "⚠ " + warnings.joined(separator: "；") + "。请核对下方最终签名值。"
-            label.textColor = .systemRed
-        } else if profile == nil {
-            label.stringValue = "尚无描述文件作为比较基准，暂时无法验证最终权限是否获授权。"
+            label.textColor = unauthorized ? .systemRed : .systemOrange
+        } else if profile?.isAvailable != true {
+            label.stringValue = "尚无可读取的本次签名描述文件，暂时无法验证最终权限是否获授权。"
             label.textColor = .systemOrange
         } else if let original = inspectedOriginalEntitlements, !original.isAvailable {
-            label.stringValue = "原 App 的签名权限不可读取；可使用描述文件或权限文件设置最终值。"
+            label.stringValue = "Mach-O 签名权限不可读取（\(original.statusText)）；可使用描述文件或权限文件设置最终值。"
             label.textColor = .systemOrange
         } else if snapshots.contains(where: { !$0.isAvailable }) {
-            label.stringValue = "部分来源读取失败，请检查文件；已读取来源未发现权限差异。"
+            label.stringValue = "部分来源缺失或读取失败；已读取来源与本次签名描述文件一致。"
             label.textColor = .systemOrange
         } else if snapshots.contains(where: { $0.isAvailable }) {
-            label.stringValue = "✓ 已读取来源与描述文件一致，最终组值在描述文件授权范围内。"
+            label.stringValue = "✓ 已读取来源与本次签名描述文件一致，最终组值在授权范围内。"
             label.textColor = .systemGreen
         } else {
-            label.stringValue = "已读取描述文件。选择应用后，将自动对比原签名权限。"
+            label.stringValue = "已读取本次签名描述文件。选择应用后，将对比 Mach-O 签名中的权限。"
             label.textColor = .secondaryLabelColor
         }
         label.toolTip = label.stringValue
@@ -780,8 +915,11 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         let entitlementsFile = entitlementFilePath
         let selectedProfile = selectedProvisioningProfile
 
+        inspectedEmbeddedProfile = nil
+        inspectedEmbeddedEntitlements = EntitlementSnapshot(sourceName: "App 内嵌描述文件", appGroups: [], keychainGroups: [],
+            applicationIdentifier: nil, teamID: nil, status: .loading, isAuthorizationScope: true)
         inspectedOriginalEntitlements = EntitlementSnapshot(
-            sourceName: "原 App Mach-O 签名",
+            sourceName: "Mach-O 签名权限",
             appGroups: [],
             keychainGroups: [],
             applicationIdentifier: nil,
@@ -803,6 +941,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         guard !inputFile.isEmpty, !inputFile.lowercased().hasPrefix("http") else {
             inspectedOriginalEntitlements = nil
             inspectedEmbeddedProfile = nil
+            inspectedEmbeddedEntitlements = nil
             if let entitlementsFile {
                 inspectedEntitlementsFile = inspectEntitlementsFile(path: entitlementsFile, teamID: selectedProfile?.teamID)
             }
@@ -820,74 +959,64 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                 guard generation == self.entitlementInspectionGeneration else { return }
                 self.inspectedOriginalEntitlements = result.original
                 self.inspectedEmbeddedProfile = result.embeddedProfile
+                self.inspectedEmbeddedEntitlements = result.embeddedEntitlements
                 self.inspectedEntitlementsFile = fileResult
-                if self.finalEntitlementSource != .custom, self.valuesForFinalSource(self.finalEntitlementSource) == nil {
-                    self.finalEntitlementSource = self.defaultFinalEntitlementSource()
-                } else if !self.finalEntitlementsUserEdited, self.finalEntitlementSource == .custom {
-                    self.finalEntitlementSource = self.defaultFinalEntitlementSource()
-                }
                 self.rebuildEntitlementInspectorContent()
             }
         }
     }
 
-    func inspectOriginalInput(path: String, profileTeamID: String?) -> (original: EntitlementSnapshot?, embeddedProfile: ProvisioningProfile?) {
+    /// Read the executable itself, not the provisioning profile or _CodeSignature/CodeResources.
+    /// codesign decodes the entitlement blob in LC_CODE_SIGNATURE (including DER representation).
+    func inspectOriginalInput(path: String, profileTeamID: String?) -> (original: EntitlementSnapshot?, embeddedProfile: ProvisioningProfile?, embeddedEntitlements: EntitlementSnapshot?) {
         var temporaryRoot: String?
         defer {
-            if let temporaryRoot {
-                try? fileManager.removeItem(atPath: temporaryRoot)
-            }
+            if let temporaryRoot { try? fileManager.removeItem(atPath: temporaryRoot) }
         }
-
         guard let appBundlePath = locateAppBundle(inputPath: path, temporaryRoot: &temporaryRoot) else {
-            return (
-                EntitlementSnapshot(
-                    sourceName: "原 App Mach-O 签名",
-                    appGroups: [],
-                    keychainGroups: [],
-                    applicationIdentifier: nil,
-                    teamID: profileTeamID,
-                    status: .unavailable("无法定位 App Bundle")
-                ),
-                nil
-            )
+            return (EntitlementSnapshot(sourceName: "Mach-O 签名权限", appGroups: [], keychainGroups: [],
+                applicationIdentifier: nil, teamID: nil, status: .unavailable("无法定位 App Bundle"), sourcePath: path), nil, nil)
         }
-
-        let embeddedProfilePath = appBundlePath.stringByAppendingPathComponent("embedded.mobileprovision")
-        let embeddedProfile = fileManager.fileExists(atPath: embeddedProfilePath) ? ProvisioningProfile(filename: embeddedProfilePath) : nil
-
-        let codesignTask = Process().execute(codesignPath, workingDirectory: nil, arguments: ["-d", "--entitlements", ":-", appBundlePath])
-        let entitlements = plistDictionary(fromCodesignOutput: codesignTask.output)
-        let displayTask = Process().execute(codesignPath, workingDirectory: nil, arguments: ["-dvvv", appBundlePath])
-        let teamID = teamIdentifier(from: displayTask.output) ?? (entitlements?["application-identifier"] as? String).flatMap { identifier in
-            identifier.split(separator: ".", maxSplits: 1).first.map(String.init)
-        } ?? profileTeamID
-
-        guard let entitlements else {
-            return (
-                EntitlementSnapshot(
-                    sourceName: "原 App Mach-O 签名",
-                    appGroups: [],
-                    keychainGroups: [],
-                    applicationIdentifier: nil,
-                    teamID: teamID,
-                    status: .unavailable(codesignTask.status == 0 ? "无 entitlement 数据" : "未签名/签名不可读")
-                ),
-                embeddedProfile
-            )
+        // Keep the original archive/member location: the extracted temporary files are deleted after inspection.
+        func originalLocation(_ extractedPath: String) -> String {
+            guard let temporaryRoot else { return extractedPath }
+            let member = String(extractedPath.dropFirst(temporaryRoot.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            return "\(path)!/\(member)"
         }
+        let profilePath = appBundlePath.stringByAppendingPathComponent("embedded.mobileprovision")
+        let hasProfile = fileManager.fileExists(atPath: profilePath)
+        let embeddedProfile = hasProfile ? ProvisioningProfile(filename: profilePath) : nil
+        var embedded = embeddedProfile.map { snapshot(from: $0, sourceName: "App 内嵌描述文件") }
+            ?? EntitlementSnapshot(sourceName: "App 内嵌描述文件", appGroups: [], keychainGroups: [],
+                applicationIdentifier: nil, teamID: nil, status: .unavailable(hasProfile ? "描述文件解析失败" : "未内嵌描述文件"), isAuthorizationScope: true)
+        embedded.sourcePath = originalLocation(profilePath)
+        embedded.sourceDescription = "embedded.mobileprovision\nEntitlements 授权范围"
 
-        return (
-            EntitlementSnapshot(
-                sourceName: "原 App Mach-O 签名",
-                appGroups: groups(named: "com.apple.security.application-groups", in: entitlements),
-                keychainGroups: groups(named: "keychain-access-groups", in: entitlements),
-                applicationIdentifier: entitlements["application-identifier"] as? String,
-                teamID: teamID,
-                status: .available
-            ),
-            embeddedProfile
-        )
+        guard let executablePath = mainExecutablePath(in: appBundlePath) else {
+            return (EntitlementSnapshot(sourceName: "Mach-O 签名权限", appGroups: [], keychainGroups: [],
+                applicationIdentifier: nil, teamID: nil, status: .unavailable("无法定位主 Mach-O"),
+                sourcePath: originalLocation(appBundlePath), sourceDescription: "Info.plist → CFBundleExecutable"), embeddedProfile, embedded)
+        }
+        let read = readMachOEntitlements(at: executablePath)
+        let entitlements = read.values
+        let teamID = entitlements?["com.apple.developer.team-identifier"] as? String
+            ?? (entitlements?["application-identifier"] as? String).flatMap { $0.split(separator: ".", maxSplits: 1).first.map(String.init) }
+        let original = EntitlementSnapshot(sourceName: "Mach-O 签名权限",
+            appGroups: entitlements.map { groups(named: "com.apple.security.application-groups", in: $0) } ?? [],
+            keychainGroups: entitlements.map { groups(named: "keychain-access-groups", in: $0) } ?? [],
+            applicationIdentifier: entitlements?["application-identifier"] as? String, teamID: teamID,
+            status: read.status,
+            sourcePath: originalLocation(executablePath),
+            sourceDescription: "LC_CODE_SIGNATURE\nEntitlements（XML / DER）\n\(executablePath.lastPathComponent)")
+        return (original, embeddedProfile, embedded)
+    }
+
+    func mainExecutablePath(in bundlePath: String) -> String? {
+        guard let info = NSDictionary(contentsOfFile: bundlePath.stringByAppendingPathComponent("Info.plist")),
+              let name = info["CFBundleExecutable"] as? String, !name.isEmpty,
+              name == (name as NSString).lastPathComponent, name != ".", name != ".." else { return nil }
+        let path = bundlePath.stringByAppendingPathComponent(name)
+        return fileManager.fileExists(atPath: path) ? path : nil
     }
 
     func locateAppBundle(inputPath: String, temporaryRoot: inout String?) -> String? {
@@ -937,7 +1066,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                 keychainGroups: [],
                 applicationIdentifier: nil,
                 teamID: teamID,
-                status: .unavailable("无法解析 Plist")
+                status: .unavailable("无法解析 Plist"),
+                sourcePath: path, sourceDescription: "独立 Plist 权限文件\n\(path.lastPathComponent)"
             )
         }
 
@@ -952,7 +1082,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             keychainGroups: groups(named: "keychain-access-groups", in: entitlements),
             applicationIdentifier: applicationIdentifier,
             teamID: inferredTeamID,
-            status: .available
+            status: .available,
+            sourcePath: path, sourceDescription: "独立 Plist 权限文件\n\(path.lastPathComponent)"
         )
     }
 
@@ -980,7 +1111,6 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         appBundlePath: String,
         bundleID: String?,
         entitlementsFilePath: String?,
-        finalSource: FinalEntitlementSource,
         appGroups: [String],
         keychainGroups: [String],
         newApplicationID: String
@@ -988,25 +1118,10 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         let originalEntitlements = signedEntitlements(forBundle: appBundlePath)
         let fileEntitlements = entitlementsFilePath.flatMap { entitlementsDictionary(fromFile: $0) }
 
-        var selectedEntitlements: [String: AnyObject]?
-        switch finalSource {
-        case .provisioningProfile:
-            selectedEntitlements = profile?.entitlements
-        case .custom:
-            selectedEntitlements = profile?.entitlements
-        case .originalApp:
-            selectedEntitlements = originalEntitlements
-        case .entitlementsFile:
-            selectedEntitlements = fileEntitlements
-        }
-
-        if selectedEntitlements == nil {
-            selectedEntitlements = profile?.entitlements ?? fileEntitlements ?? originalEntitlements
-        }
-
-        guard var entitlements = selectedEntitlements else {
-            return nil
-        }
+        // Group sources only control their own arrays, never the rest of the entitlement dictionary.
+        let base = profile?.entitlements ?? fileEntitlements ?? originalEntitlements
+        guard base != nil || !appGroups.isEmpty || !keychainGroups.isEmpty else { return nil }
+        var entitlements = base ?? [:]
 
         let applicationIdentifier = entitlements["application-identifier"] as? String
         let teamID = profile?.teamID ?? applicationIdentifier.flatMap { identifier in
@@ -1047,10 +1162,9 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         setStatus("Found \(provisioningProfiles.count) Provisioning Profile\(provisioningProfiles.count>1 || provisioningProfiles.count<1 ? "s":"")")
         ProvisioningProfilesPopup.removeAllItems()
         ProvisioningProfilesPopup.addItems(withTitles: [
-            "仅重签（使用内嵌描述文件）",
-            "自定义描述文件…",
-            "––––––––––––––––––––––"
+            "使用 App 内嵌描述文件"
         ])
+        ProvisioningProfilesPopup.menu?.addItem(.separator())
         let formatter = DateFormatter()
         formatter.dateStyle = .short
         formatter.timeStyle = .medium
@@ -1135,9 +1249,14 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             self.selectedProvisioningProfile = profile
             setStatus("已选择描述文件：\(profile.name)")
             if profile.expires.timeIntervalSince1970 < Date().timeIntervalSince1970 {
-                ProvisioningProfilesPopup.selectItem(at: 0)
+                if profileInputSource == .file {
+                    importedProvisioningProfile = nil
+                } else {
+                    ProvisioningProfilesPopup.selectItem(at: 0)
+                }
+                checkProfileID(nil)
                 setStatus("描述文件已过期")
-                chooseProvisioningProfile(ProvisioningProfilesPopup)
+                return
             }
             if profile.appID.firstIndex(of: "*") == nil {
                 // Not a wildcard profile
@@ -1152,11 +1271,13 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             }
             scheduleEntitlementInspection()
         } else {
-            ProvisioningProfilesPopup.selectItem(at: 0)
             self.profileFilename = nil
             self.selectedProvisioningProfile = nil
-            setStatus("描述文件无效")
-            chooseProvisioningProfile(ProvisioningProfilesPopup)
+            if NewApplicationIDTextField.isEnabled == false {
+                NewApplicationIDTextField.isEnabled = true
+                NewApplicationIDTextField.stringValue = ""
+            }
+            scheduleEntitlementInspection()
             rebuildEntitlementInspectorContent()
         }
     }
@@ -1174,13 +1295,12 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             if(enabled){
                 InputFileText.isEnabled = true
                 BrowseButton.isEnabled = true
-                ProvisioningProfilesPopup.isEnabled = true
-                CodesigningCertsPopup.isEnabled = true
                 NewApplicationIDTextField.isEnabled = ReEnableNewApplicationID
                 NewApplicationIDTextField.stringValue = PreviousNewApplicationID
                 StartButton.isEnabled = true
                 appDisplayName.isEnabled = true
-                entitlementSourcePopup?.isEnabled = true
+                appGroupsSourcePopup?.isEnabled = true
+                keychainGroupsSourcePopup?.isEnabled = true
                 finalAppGroupsField?.isEnabled = true
                 finalKeychainGroupsField?.isEnabled = true
                 chooseEntitlementsFileButton?.isEnabled = true
@@ -1197,7 +1317,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                 NewApplicationIDTextField.isEnabled = false
                 StartButton.isEnabled = false
                 appDisplayName.isEnabled = false
-                entitlementSourcePopup?.isEnabled = false
+                appGroupsSourcePopup?.isEnabled = false
+                keychainGroupsSourcePopup?.isEnabled = false
                 finalAppGroupsField?.isEnabled = false
                 finalKeychainGroupsField?.isEnabled = false
                 chooseEntitlementsFileButton?.isEnabled = false
@@ -1409,13 +1530,23 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     }
 
     func signedEntitlements(forBundle bundlePath: String) -> [String : AnyObject]? {
-        let entitlementsTask = Process().execute(codesignPath, workingDirectory: nil, arguments: ["-d", "--entitlements", ":-", bundlePath])
-        if entitlementsTask.status != 0 {
-            Log.write("Unable to read signed entitlements from \(bundlePath): \(entitlementsTask.output)")
-            return nil
-        }
+        guard let executablePath = mainExecutablePath(in: bundlePath) else { return nil }
+        return readMachOEntitlements(at: executablePath).values
+    }
 
-        return plistDictionary(fromCodesignOutput: entitlementsTask.output)
+    func readMachOEntitlements(at executablePath: String) -> (values: [String: AnyObject]?, status: EntitlementSnapshotStatus) {
+        let task = Process().execute(codesignPath, workingDirectory: nil, arguments: ["-d", "--entitlements", "-", "--xml", executablePath])
+        guard task.status == 0 else {
+            Log.write("Unable to read Mach-O entitlements from \(executablePath): \(task.output)")
+            return (nil, .unavailable("未签名或签名区不可读"))
+        }
+        if task.output.contains("invalid entitlements blob") {
+            return (nil, .unavailable("签名权限数据无效"))
+        }
+        guard let values = plistDictionary(fromCodesignOutput: task.output) else {
+            return (nil, .unavailable("签名存在，无 Entitlements"))
+        }
+        return (values, .available)
     }
 
     func formattedAccessGroups(_ groups: [String]) -> String {
@@ -1427,6 +1558,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     }
 
     @objc func startSigning() {
+        guard validateSigningInputs() else { return }
         let inputFile = InputFileText.stringValue
         if (inputFile.count < 4) {
             return
@@ -1462,7 +1594,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         var newDisplayName : String = ""
         var newShortVersion : String = ""
         var newVersion : String = ""
-        var finalEntitlementSource: FinalEntitlementSource = .provisioningProfile
+        var appGroupsSource: FinalEntitlementSource = .provisioningProfile
+        var keychainGroupsSource: FinalEntitlementSource = .provisioningProfile
         var finalAppGroups: [String] = []
         var finalKeychainGroups: [String] = []
         var entitlementsFilePath: String?
@@ -1470,14 +1603,15 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         DispatchQueue.main.sync {
             downloadProgress.isHidden = true
             inputFile = self.InputFileText.stringValue
-            signingCertificate = self.CodesigningCertsPopup.selectedItem?.title
+            signingCertificate = self.currentSigningCertificate
             newApplicationID = self.NewApplicationIDTextField.stringValue.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             newDisplayName = self.appDisplayName.stringValue.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             newShortVersion = self.appShortVersion.stringValue.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             newVersion = self.appVersion.stringValue.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             shouldCheckPlugins = ignorePluginsCheckbox.state == .off
             shouldSkipGetTaskAllow = noGetTaskAllowCheckbox.state == .on
-            finalEntitlementSource = self.finalEntitlementSource
+            appGroupsSource = self.finalAppGroupsSelection.source
+            keychainGroupsSource = self.finalKeychainGroupsSelection.source
             finalAppGroups = self.currentFinalAppGroups()
             finalKeychainGroups = self.currentFinalKeychainGroups()
             entitlementsFilePath = self.entitlementFilePath
@@ -1788,7 +1922,6 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                     appBundlePath: appBundlePath,
                     bundleID: bundleID,
                     entitlementsFilePath: entitlementsFilePath,
-                    finalSource: finalEntitlementSource,
                     appGroups: finalAppGroups,
                     keychainGroups: finalKeychainGroups,
                     newApplicationID: newApplicationID
@@ -1800,8 +1933,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                     ) {
                         do {
                             try data.write(to: URL(fileURLWithPath: entitlementsPlist), options: .atomic)
-                            Log.write("Using final App Groups:\n\(formattedAccessGroups(finalAppGroups))")
-                            Log.write("Using final Keychain Access Groups:\n\(formattedAccessGroups(finalKeychainGroups))")
+                            Log.write("Using final App Groups (\(appGroupsSource.title)):\n\(formattedAccessGroups(finalAppGroups))")
+                            Log.write("Using final Keychain Access Groups (\(keychainGroupsSource.title)):\n\(formattedAccessGroups(finalKeychainGroups))")
                             Log.write("–––––––––––––––––––––––\n\(String(data: data, encoding: .utf8) ?? "")")
                             Log.write("–––––––––––––––––––––––")
                             setStatus("Saved entitlements to \(entitlementsPlist)")
@@ -2012,42 +2145,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
 
     //MARK: IBActions
     @IBAction func chooseProvisioningProfile(_ sender: NSPopUpButton) {
-        defer { updateProfileDetails() }
-        
-        switch(sender.indexOfSelectedItem){
-        case 0:
-            self.profileFilename = nil
-            self.selectedProvisioningProfile = nil
-            if NewApplicationIDTextField.isEnabled == false {
-                NewApplicationIDTextField.isEnabled = true
-                NewApplicationIDTextField.stringValue = ""
-            }
-            scheduleEntitlementInspection()
-            
-        case 1:
-            let openDialog = NSOpenPanel()
-            openDialog.canChooseFiles = true
-            openDialog.canChooseDirectories = false
-            openDialog.allowsMultipleSelection = false
-            openDialog.allowsOtherFileTypes = false
-            openDialog.allowedFileTypes = ["mobileprovision"]
-            openDialog.runModal()
-            if let filename = openDialog.urls.first {
-                loadProfileFile(filename.path)
-            } else {
-                sender.selectItem(at: 0)
-                chooseProvisioningProfile(sender)
-            }
-            
-        case 2:
-            sender.selectItem(at: 0)
-            chooseProvisioningProfile(sender)
-            
-        default:
-            let profile = provisioningProfiles[sender.indexOfSelectedItem - 3]
-            checkProfileID(profile)
-        }
-        
+        guard signingControlsEnabled, profileInputSource == .existing else { return }
+        applyProfileInputSelection()
     }
     @IBAction func doBrowse(_ sender: AnyObject) {
         let openDialog = NSOpenPanel()
@@ -2065,22 +2164,12 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     @IBAction func chooseSigningCertificate(_ sender: NSPopUpButton) {
         Log.write("Set Codesigning Certificate Default to: \(sender.stringValue)")
         defaults.setValue(sender.selectedItem?.title, forKey: "signingCertificate")
-        if !isImportingCertificate {
-            certificateFilePath = nil
-            certificatePathField?.stringValue = ""
-            certificatePathField?.toolTip = nil
-            certificateHintLabel?.stringValue = "使用钥匙串中的签名身份；导入 P12 / PFX 时需包含私钥。"
-            certificateHintLabel?.textColor = .secondaryLabelColor
-        }
+        updateSigningInputSources()
     }
     
     @IBAction func doSign(_ sender: NSButton) {
-        if codesigningCerts.count > 0 {
-            NSApplication.shared.windows[0].makeFirstResponder(self)
-            startSigning()
-        } else {
-            showCodesignCertsErrorAlert()
-        }
+        window?.makeFirstResponder(self)
+        startSigning()
     }
     
     @IBAction func statusLabelClick(_ sender: NSButton) {
