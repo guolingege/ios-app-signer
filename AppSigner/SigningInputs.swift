@@ -1,9 +1,71 @@
 import Cocoa
 import Security
+import CryptoKit
+
+/// Original application values, never signing overrides or profile-derived identifiers.
+struct ApplicationMetadata {
+    let values: [String: String]
+    let sourcePath: String
+
+    static func read(at path: String, sourcePath: String) -> ApplicationMetadata? {
+        guard let data = FileManager.default.contents(atPath: path),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+              let info = plist as? [String: Any] else { return nil }
+        func text(_ key: String) -> String? {
+            if let value = info[key] as? String, !value.isEmpty { return value }
+            return (info[key] as? NSNumber)?.stringValue
+        }
+        var values: [String: String] = [:]
+        for key in ["CFBundleIdentifier", "CFBundleShortVersionString", "CFBundleVersion"] {
+            values[key] = text(key)
+        }
+        values["CFBundleDisplayName"] = text("CFBundleDisplayName") ?? text("CFBundleName")
+        return ApplicationMetadata(values: values, sourcePath: sourcePath)
+    }
+}
+
+struct SigningIdentity {
+    let fingerprint: String
+    let commonName: String
+    let displayName: String
+    let certificateData: Data?
+
+    static func parse(_ output: String, certificates: [Data]) -> [SigningIdentity] {
+        let regex = try! NSRegularExpression(pattern: #"(?m)^\s*\d+\)\s+([A-Fa-f0-9]{40})\s+"([^"]+)""#)
+        var seen = Set<String>()
+        let entries = regex.matches(in: output, range: NSRange(output.startIndex..., in: output)).compactMap { match -> (String, String)? in
+            guard let hash = Range(match.range(at: 1), in: output), let name = Range(match.range(at: 2), in: output) else { return nil }
+            let fingerprint = String(output[hash]).uppercased()
+            guard seen.insert(fingerprint).inserted else { return nil }
+            return (fingerprint, String(output[name]))
+        }
+        let counts = Dictionary(grouping: entries, by: { $0.1 }).mapValues { $0.count }
+        return entries.map { fingerprint, name in
+            SigningIdentity(fingerprint: fingerprint, commonName: name,
+                displayName: counts[name] == 1 ? name : "\(name) [\(fingerprint.suffix(8))]",
+                certificateData: certificates.first { SigningCertificateFile.fingerprint($0) == fingerprint })
+        }.sorted { $0.displayName < $1.displayName }
+    }
+}
 
 enum SigningInputSource: Int {
     case existing
     case file
+}
+
+/// This policy reads the selected external profile only, never the application's embedded profile.
+enum LeagsoftEntitlementPolicy {
+    static func values(from profile: ProvisioningProfile) -> (appGroups: [String], keychainGroups: [String], teamID: String)? {
+        // A migrated App ID prefix is not necessarily the team's identifier.
+        let teamID = (profile.teamIdentifier ?? (profile.entitlements["com.apple.developer.team-identifier"] as? String) ?? profile.teamID)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !teamID.isEmpty, !teamID.contains("*"), !teamID.contains(".") else { return nil }
+        return (
+            profile.entitlements["com.apple.security.application-groups"] as? [String] ?? [],
+            ["\(teamID).com.apple.networkextensionsharing", "\(teamID).com.leagsoft.emm"],
+            teamID
+        )
+    }
 }
 
 /// Shared path handling for Finder drops, copied paths, and file:// URLs.
@@ -14,13 +76,17 @@ enum SigningFilePath {
            (first == "\"" && last == "\"") || (first == "'" && last == "'") {
             path = String(path.dropFirst().dropLast())
         }
-        if let url = URL(string: path), url.isFileURL { return url.path }
-        return (path as NSString).expandingTildeInPath
+        if let url = URL(string: path), url.isFileURL {
+            guard url.host == nil || url.host == "" || url.host == "localhost" else { return path }
+            return url.path
+        }
+        // NSString expansion also collapses // and ://, which can disguise remote paths.
+        return path.hasPrefix("~") ? (path as NSString).expandingTildeInPath : path
     }
 
     static func paths(from pasteboard: NSPasteboard) -> [String] {
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
-            return urls.map { $0.path }
+            return urls.map { normalize($0.absoluteString) }
         }
         if let paths = pasteboard.propertyList(forType: .init("NSFilenamesPboardType")) as? [String], !paths.isEmpty {
             return paths
@@ -51,7 +117,7 @@ final class SigningPathField: NSTextField {
 
     private func acceptedPath(_ sender: NSDraggingInfo) -> String? {
         guard isEnabled, let path = SigningFilePath.paths(from: sender.draggingPasteboard).first,
-              allowedExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased()),
+              OfflineNetworkPolicy.isLocalPath(path), allowedExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased()),
               FileManager.default.fileExists(atPath: path) else { return nil }
         return path
     }
@@ -70,11 +136,26 @@ final class SigningPathField: NSTextField {
 }
 
 enum SigningCertificateFile {
+    static func fingerprint(_ data: Data) -> String {
+        Insecure.SHA1.hash(data: data).map { String(format: "%02X", $0) }.joined()
+    }
+
+    static func fileDigest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02X", $0) }.joined() }
+
+    static func keychainCertificates() -> [Data] {
+        var result: CFTypeRef?
+        let query: [String: Any] = [kSecClass as String: kSecClassCertificate, kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnData as String: true, kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail]
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return [] }
+        return result as? [Data] ?? []
+    }
+
     /// The caller supplies the destination, allowing imports to be verified in an isolated keychain.
-    static func importData(_ data: Data, filename: String, password: String, keychain: SecKeychain) -> (status: OSStatus, names: [String]) {
+    static func importData(_ data: Data, filename: String, password: String, keychain: SecKeychain) -> (status: OSStatus, names: [String], certificates: [Data]) {
         var items: CFArray?
         let status: OSStatus
         var names: [String] = []
+        var certificates: [Data] = []
         if ["p12", "pfx"].contains(filename.pathExtension.lowercased()) {
             // SecPKCS12Import supports modern encrypted P12 files that SecItemImport rejects.
             let options = [
@@ -86,7 +167,10 @@ enum SigningCertificateFile {
                 if let identity = entry[kSecImportItemIdentity as String] {
                     var certificate: SecCertificate?
                     _ = SecIdentityCopyCertificate(identity as! SecIdentity, &certificate)
-                    if let certificate, let name = SecCertificateCopySubjectSummary(certificate) as String? { names.append(name) }
+                    if let certificate, let name = SecCertificateCopySubjectSummary(certificate) as String? {
+                        names.append(name)
+                        certificates.append(SecCertificateCopyData(certificate) as Data)
+                    }
                 }
             }
         } else {
@@ -98,10 +182,13 @@ enum SigningCertificateFile {
             }
             for item in (items as? [AnyObject]) ?? [] {
                 if CFGetTypeID(item) == SecCertificateGetTypeID(),
-                   let name = SecCertificateCopySubjectSummary(item as! SecCertificate) as String? { names.append(name) }
+                   let name = SecCertificateCopySubjectSummary(item as! SecCertificate) as String? {
+                    names.append(name)
+                    certificates.append(SecCertificateCopyData(item as! SecCertificate) as Data)
+                }
             }
         }
-        return (status, names)
+        return (status, names, certificates)
     }
 }
 
@@ -122,11 +209,20 @@ extension MainView {
         window.autorecalculatesKeyViewLoop = true
         window.center()
 
-        let header = verticalStack(spacing: 5)
-        header.addArrangedSubview(uiLabel("iOS App Signer", size: 23, weight: .semibold))
-        header.addArrangedSubview(uiLabel("选择签名材料，核对权限，再导出签名后的应用。", size: 12, secondary: true))
+        let header = horizontalStack(spacing: 16)
+        let title = verticalStack(spacing: 5)
+        title.addArrangedSubview(uiLabel("联软EMM签名", size: 23, weight: .semibold))
+        title.addArrangedSubview(uiLabel("离线签名 · 选择本地材料，核对权限，再导出应用。", size: 12, secondary: true))
+        header.addArrangedSubview(title)
+        let refresh = NSButton(title: "刷新", target: self, action: #selector(refreshSigningInputs(_:)))
+        refresh.toolTip = "统一刷新：重新读取应用信息、Mach-O 权限、内嵌 / 外部描述文件、权限文件及证书，包含同一路径被替换的文件。保留已填写的签名新值；Bundle ID 仍受所选描述文件约束。"
+        refresh.translatesAutoresizingMaskIntoConstraints = false
+        refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true
+        refreshInspectionButton = refresh
+        header.addArrangedSubview(refresh)
+        title.widthAnchor.constraint(equalTo: header.widthAnchor, constant: -92).isActive = true
         addSubview(header)
-        for label in header.arrangedSubviews { label.widthAnchor.constraint(equalTo: header.widthAnchor).isActive = true }
+        for label in title.arrangedSubviews { label.widthAnchor.constraint(equalTo: title.widthAnchor).isActive = true }
 
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -154,7 +250,7 @@ extension MainView {
         let materials = verticalStack(spacing: 8)
         materials.addArrangedSubview(sectionHeading("签名材料", subtitle: "证书和描述文件各选一种来源；仅当前方式生效。"))
         BrowseButton.title = "选择应用…"
-        InputFileText.placeholderString = "拖入 IPA / App，或粘贴路径 / 下载地址"
+        InputFileText.placeholderString = "拖入本地 IPA / App，或粘贴本地路径"
         materials.addArrangedSubview(labeledRow("应用文件", views: [InputFileText, BrowseButton]))
         CodesigningCertsPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         certificateSourceControl = sourceControl(labels: ["从钥匙串选择", "使用证书文件"], action: #selector(certificateSourceChanged(_:)))
@@ -182,30 +278,25 @@ extension MainView {
         materials.addArrangedSubview(profileFileRow!)
         profileDetailsLabel = uiLabel("未选择描述文件，将尝试使用应用内嵌的描述文件。", size: 11, secondary: true)
         materials.addArrangedSubview(indented(profileDetailsLabel!))
+        certificateMatchLabel = uiLabel("正在检查证书与描述文件…", size: 11, secondary: true)
+        materials.addArrangedSubview(indented(certificateMatchLabel!))
         let materialsCard = addCard(materials, to: topCards, fullWidth: false)
         materialsCard.widthAnchor.constraint(equalTo: topCards.widthAnchor, multiplier: 0.62, constant: -8).isActive = true
 
         let metadata = verticalStack(spacing: 9)
-        metadata.addArrangedSubview(sectionHeading("应用信息", subtitle: "可选；留空的字段保留应用原值。"))
-        NewApplicationIDTextField.placeholderString = "保留原 Bundle ID"
-        appDisplayName.placeholderString = "保留原应用名称"
-        appShortVersion.placeholderString = "例如 5.15"
-        appVersion.placeholderString = "例如 2026111701"
-        for (title, field) in [("Bundle ID", NewApplicationIDTextField!), ("显示名称", appDisplayName!)] {
-            let column = verticalStack(spacing: 4)
-            column.addArrangedSubview(uiLabel(title, size: 11, secondary: true))
-            column.addArrangedSubview(field)
-            field.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
-            metadata.addArrangedSubview(column)
-        }
+        metadata.addArrangedSubview(sectionHeading("应用信息", subtitle: "当前值来自应用 Info.plist；下方可填写签名新值。"))
+        applicationMetadataStatusLabel = uiLabel("未选择应用", size: 11, secondary: true)
+        metadata.addArrangedSubview(applicationMetadataStatusLabel!)
+        NewApplicationIDTextField.placeholderString = "新 Bundle ID（留空保留）"
+        NewApplicationIDTextField.toolTip = "签名使用的 Bundle ID；精确描述文件会自动指定该值。上方“当前”始终显示原应用的 Bundle ID。"
+        appDisplayName.placeholderString = "新显示名称（留空保留）"
+        appShortVersion.placeholderString = "新版本号（可选）"
+        appVersion.placeholderString = "新构建号（可选）"
+        metadata.addArrangedSubview(applicationMetadataColumn("Bundle ID", key: "CFBundleIdentifier", field: NewApplicationIDTextField))
+        metadata.addArrangedSubview(applicationMetadataColumn("显示名称", key: "CFBundleDisplayName", field: appDisplayName))
         let details = horizontalStack(spacing: 12)
-        for (title, field) in [("版本号", appShortVersion!), ("构建号", appVersion!)] {
-            let column = verticalStack(spacing: 6)
-            column.addArrangedSubview(uiLabel(title, size: 11, secondary: true))
-            column.addArrangedSubview(field)
-            field.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
-            details.addArrangedSubview(column)
-        }
+        details.addArrangedSubview(applicationMetadataColumn("版本号", key: "CFBundleShortVersionString", field: appShortVersion))
+        details.addArrangedSubview(applicationMetadataColumn("构建号", key: "CFBundleVersion", field: appVersion))
         details.distribution = .fillEqually
         metadata.addArrangedSubview(details)
         ignorePluginsCheckbox.title = "跳过 PlugIns 扩展"
@@ -243,8 +334,6 @@ extension MainView {
         StartButton.toolTip = "核对签名材料及最终权限后，选择导出位置并开始签名。"
         StartButton.widthAnchor.constraint(equalToConstant: 120).isActive = true
         footer.addArrangedSubview(StatusLabel)
-        downloadProgress.widthAnchor.constraint(equalToConstant: 100).isActive = true
-        footer.addArrangedSubview(downloadProgress)
         footer.addArrangedSubview(StartButton)
         addSubview(footer)
         let divider = NSBox()
@@ -278,6 +367,31 @@ extension MainView {
         updateSigningInputSources()
     }
 
+    func applicationMetadataColumn(_ title: String, key: String, field: NSTextField) -> NSStackView {
+        let column = verticalStack(spacing: 4)
+        column.addArrangedSubview(uiLabel(title, size: 11, secondary: true))
+        let current = uiLabel("当前：—", size: 12, weight: .medium)
+        current.isSelectable = true
+        current.maximumNumberOfLines = 2
+        current.lineBreakMode = .byTruncatingMiddle
+        applicationMetadataLabels[key] = current
+        column.addArrangedSubview(current)
+        column.addArrangedSubview(field)
+        current.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+        field.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+        return column
+    }
+
+    func updateApplicationMetadataDisplay(status: String) {
+        applicationMetadataStatusLabel?.stringValue = status
+        applicationMetadataStatusLabel?.toolTip = inspectedApplicationMetadata?.sourcePath ?? status
+        for (key, label) in applicationMetadataLabels {
+            let value = inspectedApplicationMetadata.map { $0.values[key] ?? "未设置" } ?? "—"
+            label.stringValue = "当前：\(value)"
+            label.toolTip = inspectedApplicationMetadata.map { "\(value)\n来源：\($0.sourcePath)\n\(key == "CFBundleDisplayName" ? "CFBundleDisplayName（缺失时使用 CFBundleName）" : key)" } ?? status
+        }
+    }
+
     func sourceControl(labels: [String], action: Selector) -> NSSegmentedControl {
         let control = NSSegmentedControl(labels: labels, trackingMode: .selectOne, target: self, action: action)
         control.selectedSegment = 0
@@ -306,14 +420,97 @@ extension MainView {
     /// The inactive source is retained for switching back, but never participates in signing.
     var currentSigningCertificate: String? {
         if certificateInputSource == .file {
-            guard let name = importedCertificateName, codesigningCerts.contains(name) else { return nil }
+            guard let name = importedCertificateName, let fingerprint = importedCertificateFingerprint,
+                  codesigningCerts.contains(name),
+                  signingIdentities.contains(where: { $0.fingerprint == fingerprint && $0.displayName == name }) else { return nil }
             return name
         }
         guard let name = CodesigningCertsPopup.titleOfSelectedItem, codesigningCerts.contains(name) else { return nil }
         return name
     }
 
+    var currentSigningIdentity: SigningIdentity? {
+        guard let name = currentSigningCertificate else { return nil }
+        return signingIdentities.first { $0.displayName == name }
+    }
+
+    var currentSigningCertificateFingerprint: String? { currentSigningIdentity?.fingerprint }
+
+    var activeSigningProfile: ProvisioningProfile? {
+        guard profileReadError == nil else { return nil }
+        if let profile = selectedProvisioningProfile { return profile }
+        return !isLeagsoftApp && profileInputSource == .existing ? inspectedEmbeddedProfile : nil
+    }
+
+    var certificateFileValidationMessage: String? {
+        guard certificateInputSource == .file else { return nil }
+        guard let path = certificateFilePath, let digest = importedCertificateFileDigest,
+              OfflineNetworkPolicy.isLocalPath(path), let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              SigningCertificateFile.fileDigest(data) == digest else {
+            return "证书文件已更改、丢失或尚未导入，请刷新并重新导入；不会沿用旧证书。"
+        }
+        return nil
+    }
+
+    var certificateProfileValidationMessage: String? {
+        if let message = profileReadError { return message }
+        if let message = certificateFileValidationMessage { return message }
+        guard let identity = currentSigningIdentity, let data = identity.certificateData else {
+            return "无法读取当前签名身份的证书；请刷新或重新导入包含私钥的证书。"
+        }
+        guard let profile = activeSigningProfile else { return "尚无可读取的签名描述文件，无法检查证书是否匹配。" }
+        guard profile.expires > Date() else { return "签名描述文件已过期。" }
+        guard !profile.developerCertificates.isEmpty else { return "描述文件缺少 DeveloperCertificates，无法验证签名证书。" }
+        guard profile.developerCertificates.contains(data) else {
+            return "证书与描述文件不匹配：DeveloperCertificates 中未包含当前证书（\(identity.fingerprint.suffix(8))）。"
+        }
+        return nil
+    }
+
+    var signingReadinessMessage: String? {
+        let path = SigningFilePath.normalize(InputFileText.stringValue)
+        guard !path.isEmpty else { return "请选择本地应用文件。" }
+        guard OfflineNetworkPolicy.isLocalPath(path) else { return "仅支持本地文件；禁止下载地址和网络路径。" }
+        guard fileManager.fileExists(atPath: path), MainView.allowedFileTypes.contains(path.pathExtension.lowercased()) else { return "应用文件不存在或格式不支持。" }
+        guard inspectedInputPath == path else { return "应用路径已更改，请刷新检查结果。" }
+        if profileInputSource == .file,
+           SigningFilePath.normalize(profilePathField?.stringValue ?? "") != (importedProvisioningProfile?.filename ?? unreadableProfilePath ?? "") {
+            return "描述文件路径尚未读取，请完成选择或刷新。"
+        }
+        if certificateInputSource == .file,
+           SigningFilePath.normalize(certificatePathField?.stringValue ?? "") != (certificateFilePath ?? "") {
+            return "证书路径尚未导入，请完成选择或刷新。"
+        }
+        if SigningFilePath.normalize(entitlementFilePathLabel?.stringValue ?? "") != (entitlementFilePath ?? "") {
+            return "权限文件路径尚未读取，请完成选择或刷新。"
+        }
+        if case .loading? = inspectedOriginalEntitlements?.status { return "正在重新读取应用和描述文件，检查完成后才能签名。" }
+        if let message = signingInputValidationMessage { return message }
+        if !isLeagsoftApp {
+            for kind in AccessGroupKind.allCases {
+                let source = groupSelection(for: kind).source
+                if source != .custom, snapshot(for: source)?.isAvailable != true {
+                    return "\(kind.title) 选择的来源“\(source.title)”不可读取，请刷新或重新选择最终来源。"
+                }
+            }
+        }
+        return nil
+    }
+
+    func updateSigningReadiness() {
+        guard StartButton != nil else { return }
+        let message = signingReadinessMessage
+        StartButton.isEnabled = signingControlsEnabled && message == nil
+        StartButton.toolTip = message ?? "证书与描述文件匹配，可以开始离线签名。"
+        let mismatch = certificateProfileValidationMessage
+        certificateMatchLabel?.stringValue = mismatch ?? "✓ 证书与描述文件匹配（已核对 DeveloperCertificates）。"
+        certificateMatchLabel?.textColor = mismatch == nil ? .systemGreen : (mismatch!.contains("不匹配") ? .systemRed : .systemOrange)
+        certificateMatchLabel?.toolTip = currentSigningIdentity.map { "证书 SHA-1: \($0.fingerprint)\n\(mismatch ?? "匹配")" }
+    }
+
     var signingInputValidationMessage: String? {
+        if let message = profileReadError { return message }
+        if let message = leagsoftValidationMessage { return message }
         if currentSigningCertificate == nil {
             return certificateInputSource == .file
                 ? "当前使用证书文件：请先导入包含私钥的有效签名证书。不会使用钥匙串列表中的其他证书。"
@@ -326,11 +523,11 @@ extension MainView {
            profile.expires <= Date() || !fileManager.fileExists(atPath: profile.filename) {
             return "当前描述文件已过期或文件已不存在，请重新选择。"
         }
-        return nil
+        return certificateProfileValidationMessage
     }
 
     func validateSigningInputs() -> Bool {
-        guard let message = signingInputValidationMessage else { return true }
+        guard let message = signingReadinessMessage else { return true }
         showSigningFileError("请完善当前方式的签名材料", detail: message)
         return false
     }
@@ -339,8 +536,29 @@ extension MainView {
         let index = ProvisioningProfilesPopup.indexOfSelectedItem - 2
         let profile = profileInputSource == .file ? importedProvisioningProfile
             : (provisioningProfiles.indices.contains(index) ? provisioningProfiles[index] : nil)
-        checkProfileID(profile)
+        if let path = profile?.filename ?? (profileInputSource == .file ? unreadableProfilePath : nil) {
+            rereadExternalProfile(at: path)
+        } else { checkProfileID(nil, inspect: false) }
+        scheduleEntitlementInspection()
         updateSigningInputSources()
+    }
+
+    private func rereadExternalProfile(at path: String) {
+        if let profile = ProvisioningProfile(filename: path), profile.expires > Date() {
+            if profileInputSource == .file { importedProvisioningProfile = profile }
+            if let index = provisioningProfiles.firstIndex(where: { $0.filename == path }) {
+                provisioningProfiles[index] = profile
+                let item = ProvisioningProfilesPopup.item(at: index + 2)
+                item?.title = "\(profile.name) (\(profile.teamID))"
+                item?.toolTip = "\(profile.name)\nTeam ID: \(profile.teamID)\n\(profile.filename)"
+            }
+            checkProfileID(profile, inspect: false)
+        } else {
+            checkProfileID(nil, inspect: false)
+            if profileInputSource == .file { importedProvisioningProfile = nil }
+            profileReadError = "外部描述文件不可读取或已过期，已停用签名。请更换文件或再次刷新。"
+            unreadableProfilePath = path
+        }
     }
 
     func updateSigningInputSources() {
@@ -369,6 +587,7 @@ extension MainView {
                 ?? "钥匙串中没有可用签名身份，可切换到“使用证书文件”。"
         }
         updateProfileDetails()
+        updateSigningReadiness()
     }
 
     func uiLabel(_ text: String, size: CGFloat = 12, weight: NSFont.Weight = .regular, secondary: Bool = false) -> NSTextField {
@@ -478,7 +697,7 @@ extension MainView {
     func loadProfileFile(_ value: String) {
         guard signingControlsEnabled else { return }
         let path = SigningFilePath.normalize(value)
-        guard path.pathExtension.lowercased() == "mobileprovision", fileManager.fileExists(atPath: path),
+        guard OfflineNetworkPolicy.isLocalPath(path), path.pathExtension.lowercased() == "mobileprovision", fileManager.fileExists(atPath: path),
               let profile = ProvisioningProfile(filename: path) else {
             showSigningFileError("无法读取描述文件", detail: "请选择有效的 .mobileprovision 文件。\n\(path)")
             profilePathField?.stringValue = importedProvisioningProfile?.filename ?? ""
@@ -496,9 +715,22 @@ extension MainView {
 
     func updateProfileDetails() {
         let profile = selectedProvisioningProfile
-        profilePathField?.stringValue = importedProvisioningProfile?.filename ?? ""
-        profilePathField?.toolTip = importedProvisioningProfile?.filename
+        let path = unreadableProfilePath ?? importedProvisioningProfile?.filename
+        profilePathField?.stringValue = path ?? ""
+        profilePathField?.toolTip = path
+        if let message = profileReadError {
+            profileDetailsLabel?.stringValue = message
+            profileDetailsLabel?.textColor = .systemRed
+            profileDetailsLabel?.toolTip = unreadableProfilePath
+            return
+        }
         guard let profile else {
+            if isLeagsoftApp {
+                profileDetailsLabel?.stringValue = "联软应用需选择外部描述文件；不会使用 App 内嵌描述文件。"
+                profileDetailsLabel?.textColor = .systemOrange
+                profileDetailsLabel?.toolTip = nil
+                return
+            }
             profileDetailsLabel?.stringValue = profileInputSource == .file
                 ? "尚未选择文件；不会使用已安装或 App 内嵌的描述文件。"
                 : "当前生效 · App 内嵌描述文件（未内嵌时不使用描述文件）。"
@@ -509,7 +741,8 @@ extension MainView {
         let date = DateFormatter()
         date.dateStyle = .medium
         let source = profileInputSource == .file ? "指定文件" : "已安装配置"
-        profileDetailsLabel?.stringValue = "当前生效 · \(source)：\(profile.name)  ·  Team ID: \(profile.teamID)  ·  有效期至 \(date.string(from: profile.expires))"
+        let teamID = LeagsoftEntitlementPolicy.values(from: profile)?.teamID ?? profile.teamID
+        profileDetailsLabel?.stringValue = "当前生效 · \(source)：\(profile.name)  ·  Team ID: \(teamID)  ·  有效期至 \(date.string(from: profile.expires))"
         profileDetailsLabel?.textColor = .secondaryLabelColor
         profileDetailsLabel?.toolTip = "Bundle ID: \(profile.appID)\n\(profile.filename)"
     }
@@ -519,7 +752,7 @@ extension MainView {
         isImportingCertificate = true
         defer { isImportingCertificate = false }
         let path = SigningFilePath.normalize(value)
-        guard MainView.certificateFileTypes.contains(path.pathExtension.lowercased()),
+        guard OfflineNetworkPolicy.isLocalPath(path), MainView.certificateFileTypes.contains(path.pathExtension.lowercased()),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
             showSigningFileError("无法读取证书文件", detail: "请选择 .p12、.pfx、.cer、.crt 或 .pem 文件。\n\(path)")
             certificatePathField?.stringValue = certificateFilePath ?? ""
@@ -558,16 +791,21 @@ extension MainView {
             certificatePathField?.stringValue = certificateFilePath ?? ""
             return
         }
-        finishCertificateImport(path: path, names: result.names)
+        finishCertificateImport(path: path, names: result.names, certificates: result.certificates, fileDigest: SigningCertificateFile.fileDigest(data))
     }
 
-    func finishCertificateImport(path: String, names: [String]) {
+    func finishCertificateImport(path: String, names: [String], certificates: [Data] = [], fileDigest: String? = nil) {
         let previous = CodesigningCertsPopup.titleOfSelectedItem
         populateCodesigningCerts()
         if let previous { CodesigningCertsPopup.selectItem(withTitle: previous) }
         certificateFilePath = path
         certificateInputSource = .file
-        importedCertificateName = names.first(where: { codesigningCerts.contains($0) })
+        let fingerprints = Set(certificates.map { SigningCertificateFile.fingerprint($0) })
+        let matches = signingIdentities.filter { fingerprints.contains($0.fingerprint) }
+        let imported = matches.count == 1 ? matches.first : nil
+        importedCertificateName = imported?.displayName
+        importedCertificateFingerprint = imported?.fingerprint
+        importedCertificateFileDigest = fileDigest ?? (try? Data(contentsOf: URL(fileURLWithPath: path))).map { SigningCertificateFile.fileDigest($0) }
         certificatePathField?.stringValue = path
         certificatePathField?.toolTip = path
         updateSigningInputSources()
@@ -582,10 +820,14 @@ extension MainView {
     func setSigningInputControlsEnabled(_ enabled: Bool) {
         updateSigningInputSources()
         entitlementFilePathLabel?.isEnabled = enabled
-        appGroupsSourcePopup?.isEnabled = enabled
-        keychainGroupsSourcePopup?.isEnabled = enabled
+        leagsoftAppCheckbox?.isEnabled = enabled
+        refreshInspectionButton?.isEnabled = enabled
+        appGroupsSourcePopup?.isEnabled = enabled && !isLeagsoftApp
+        keychainGroupsSourcePopup?.isEnabled = enabled && !isLeagsoftApp
         finalAppGroupsField?.isEnabled = enabled
         finalKeychainGroupsField?.isEnabled = enabled
+        finalAppGroupsField?.isEditable = !isLeagsoftApp
+        finalKeychainGroupsField?.isEditable = !isLeagsoftApp
         chooseEntitlementsFileButton?.isEnabled = enabled
         clearEntitlementsFileButton?.isEnabled = enabled && entitlementFilePath != nil
         appShortVersion.isEnabled = enabled
@@ -594,8 +836,39 @@ extension MainView {
         noGetTaskAllowCheckbox.isEnabled = enabled
     }
 
+    /// File paths are not cache keys: re-read the actual bytes, including unchanged paths.
+    @objc func refreshSigningInputs(_ sender: Any?) {
+        guard signingControlsEnabled, !isImportingCertificate else { return }
+        window?.makeFirstResponder(nil)
+        pathEditWorkItem?.cancel()
+        StartButton.isEnabled = false
+        let profilePath = selectedProvisioningProfile?.filename ?? unreadableProfilePath
+        populateCodesigningCerts()
+
+        var changedCertificatePath: String?
+        if certificateInputSource == .file, let path = certificateFilePath {
+            let data = OfflineNetworkPolicy.isLocalPath(path) ? try? Data(contentsOf: URL(fileURLWithPath: path)) : nil
+            if data.map({ SigningCertificateFile.fileDigest($0) }) != importedCertificateFileDigest || data == nil {
+                // A replaced P12 must be imported again; cancellation must not keep the old identity alive.
+                importedCertificateName = nil
+                importedCertificateFingerprint = nil
+                importedCertificateFileDigest = nil
+                if data != nil { changedCertificatePath = path }
+            }
+        }
+
+        if let path = profilePath {
+            rereadExternalProfile(at: path)
+        }
+        scheduleEntitlementInspection()
+        updateSigningInputSources()
+        setStatus("已触发刷新，检查结果将按当前文件内容更新。")
+        if let path = changedCertificatePath { loadCertificateFile(path) }
+    }
+
     func acceptPathEdit(_ field: NSTextField, reportError: Bool) {
         guard signingControlsEnabled else { return }
+        defer { updateSigningReadiness() }
         guard field !== profilePathField || profileInputSource == .file,
               field !== certificatePathField || certificateInputSource == .file else { return }
         let path = SigningFilePath.normalize(field.stringValue)
@@ -606,7 +879,7 @@ extension MainView {
         }
         if !reportError, let pathField = field as? SigningPathField,
            !pathField.allowedExtensions.contains(path.pathExtension.lowercased()) { return }
-        let exists = fileManager.fileExists(atPath: path)
+        let exists = OfflineNetworkPolicy.isLocalPath(path) && fileManager.fileExists(atPath: path)
         if field === profilePathField {
             if path == importedProvisioningProfile?.filename { field.stringValue = path; return }
             if exists || reportError { loadProfileFile(path) }

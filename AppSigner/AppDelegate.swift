@@ -12,6 +12,15 @@ import Cocoa
 class AppDelegate: NSObject, NSApplicationDelegate {
 
     @IBOutlet weak var mainView: MainView!
+
+    override init() {
+        super.init()
+        // Fail closed before app initialization can spawn helpers or load signing materials.
+        guard OfflineNetworkPolicy.activate() else {
+            fputs("联软EMM签名：无法启用禁止联网策略，已停止启动。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    }
     @objc let fileManager = FileManager.default
     
     
@@ -26,17 +35,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return true
-    }
-    @IBAction func fixSigning(_ sender: NSMenuItem) {
-        if let tempFolder = mainView.makeTempFolder() {
-            iASShared.fixSigning(tempFolder)
-            try? fileManager.removeItem(atPath: tempFolder)
-            mainView.populateCodesigningCerts()
-        }
-    }
-
-    @IBAction func nsMenuLinkClick(_ sender: NSMenuLink) {
-        NSWorkspace.shared.open(URL(string: sender.url!)!)
     }
     @IBAction func viewLog(_ sender: AnyObject) {
         NSWorkspace.shared.openFile(Log.logName)

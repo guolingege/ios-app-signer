@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Local Mach-O/profile fixtures. No installed identities or user keychains are used."""
+import copy
 import datetime
 import pathlib
 import plistlib
@@ -17,6 +18,8 @@ def run(*args):
 def plist(path, value):
     path.write_bytes(plistlib.dumps(value))
 
+run('openssl', 'x509', '-in', str(root / 'certificate.pem'), '-outform', 'DER', '-out', str(root / 'certificate.der'))
+
 entitlements = {
     'application-identifier': 'FIXTURETEAM.com.example.fixture',
     'com.apple.developer.team-identifier': 'FIXTURETEAM',
@@ -26,6 +29,7 @@ entitlements = {
 plist(root / 'macho.entitlements', entitlements)
 profile = {
     'Name': 'Embedded Authorization Fixture',
+    'DeveloperCertificates': [(root / 'certificate.der').read_bytes()],
     'CreationDate': datetime.datetime(2026, 1, 1),
     'ExpirationDate': datetime.datetime(2030, 1, 1),
     'Entitlements': dict(entitlements, **{'keychain-access-groups': ['FIXTURETEAM.*']}),
@@ -43,6 +47,38 @@ plist(root / 'selected.plist', profile)
 run('openssl', 'cms', '-sign', '-binary', '-nodetach', '-in', str(root / 'selected.plist'),
     '-signer', str(root / 'certificate.pem'), '-inkey', str(root / 'key.pem'),
     '-outform', 'DER', '-out', str(root / 'selected.mobileprovision'))
+# Additional signed local profiles for exact certificate matching and same-path refresh.
+for name in ['mismatch', 'missing-certificates', 'expired', 'empty-groups', 'other-team', 'migrated-prefix', 'top-level-team']:
+    variant = copy.deepcopy(profile)
+    if name == 'mismatch':
+        # Distinct DER with the same subject/team must never match by display name.
+        run('openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+            '-keyout', str(root / 'other-key.pem'), '-out', str(root / 'other-certificate.pem'),
+            '-subj', '/CN=Signer UI Import Fixture', '-days', '1')
+        run('openssl', 'x509', '-in', str(root / 'other-certificate.pem'), '-outform', 'DER', '-out', str(root / 'other-certificate.der'))
+        variant['DeveloperCertificates'] = [(root / 'other-certificate.der').read_bytes()]
+    elif name == 'missing-certificates':
+        del variant['DeveloperCertificates']
+    elif name == 'expired':
+        variant['ExpirationDate'] = datetime.datetime(2025, 1, 1)
+    elif name == 'empty-groups':
+        del variant['Entitlements']['com.apple.security.application-groups']
+    elif name == 'other-team':
+        variant['Entitlements']['com.apple.developer.team-identifier'] = 'OTHERTEAM'
+        variant['Entitlements']['application-identifier'] = 'OTHERTEAM.com.example.fixture'
+        variant['Entitlements']['com.apple.security.application-groups'] = ['group.com.example.refreshed']
+        variant['Entitlements']['keychain-access-groups'] = ['OTHERTEAM.*']
+    elif name == 'top-level-team':
+        variant['TeamIdentifier'] = ['REALTEAM']
+        del variant['Entitlements']['com.apple.developer.team-identifier']
+        variant['Entitlements']['application-identifier'] = 'OLDPREFIX.com.example.fixture'
+    elif name == 'migrated-prefix':
+        variant['Entitlements']['application-identifier'] = 'OLDPREFIX.com.example.fixture'
+    plist(root / (name + '.plist'), variant)
+    run('openssl', 'cms', '-sign', '-binary', '-nodetach', '-in', str(root / (name + '.plist')),
+        '-signer', str(root / 'certificate.pem'), '-inkey', str(root / 'key.pem'),
+        '-outform', 'DER', '-out', str(root / (name + '.mobileprovision')))
+
 (root / 'fixture.c').write_text('int main(void) { return 0; }\n')
 run('xcrun', 'clang', '-arch', 'arm64', str(root / 'fixture.c'), '-o', str(root / 'fixture'))
 run('/usr/bin/codesign', '-s', '-', '--force', '--entitlements', str(root / 'macho.entitlements'),
@@ -82,7 +118,11 @@ for name, contents in [('Signed', original), ('DEROnly', without_slots(original,
                        ('Unsigned', original), ('BadProfile', original), ('NoProfile', original)]:
     bundle = root / (name + '.app')
     bundle.mkdir()
-    plist(bundle / 'Info.plist', {'CFBundleExecutable': 'Fixture', 'CFBundleIdentifier': 'com.example.fixture'})
+    plist(bundle / 'Info.plist', {
+        'CFBundleExecutable': 'Fixture', 'CFBundleIdentifier': 'com.example.fixture',
+        'CFBundleDisplayName': '原应用名称', 'CFBundleName': 'Fixture',
+        'CFBundleShortVersionString': '5.15', 'CFBundleVersion': '2026111701',
+    })
     binary = bundle / 'Fixture'
     binary.write_bytes(contents)
     binary.chmod(0o755)

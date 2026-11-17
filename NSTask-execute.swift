@@ -22,17 +22,19 @@ extension Process {
         self.standardOutput = pipe
         self.standardError = pipe
         let pipeFile = pipe.fileHandleForReading
-        self.launch()
-        
-        let data = NSMutableData()
-        while self.isRunning {
-            data.append(pipeFile.availableData)
+        do {
+            try self.run()
+        } catch {
+            return AppSignerTaskOutput(status: -1, output: error.localizedDescription)
         }
+
+        // Drain to EOF before waiting, retaining output even for very short-lived helpers.
+        // Never terminate a task after it has exited (or after its PID has been reused).
+        let data = pipeFile.readDataToEndOfFile()
+        self.waitUntilExit()
+        pipeFile.closeFile()
         
-        pipeFile.closeFile();
-        self.terminate();
-        
-        if let output = String.init(data: data as Data, encoding: String.Encoding.utf8) {
+        if let output = String.init(data: data, encoding: String.Encoding.utf8) {
             return AppSignerTaskOutput(status: self.terminationStatus, output: output)
         } else {
             return AppSignerTaskOutput(status: self.terminationStatus, output: "")
@@ -41,12 +43,12 @@ extension Process {
     }
     
     func execute(_ launchPath: String, workingDirectory: String?, arguments: [String]?)->AppSignerTaskOutput{
-        self.launchPath = launchPath
+        self.executableURL = URL(fileURLWithPath: launchPath)
         if arguments != nil {
             self.arguments = arguments
         }
         if workingDirectory != nil {
-            self.currentDirectoryPath = workingDirectory!
+            self.currentDirectoryURL = URL(fileURLWithPath: workingDirectory!)
         }
         return self.launchSynchronous()
     }

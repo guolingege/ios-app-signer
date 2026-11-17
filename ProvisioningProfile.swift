@@ -9,6 +9,8 @@
 import Foundation
 import AppKit
 struct ProvisioningProfile {
+    var developerCertificates: [Data] = []
+    var teamIdentifier: String? = nil
     var filename: String,
         name: String,
         created:Date,
@@ -59,6 +61,7 @@ struct ProvisioningProfile {
     }
     
     init?(filename: String){
+        guard OfflineNetworkPolicy.isLocalPath(filename) else { return nil }
         let securityArgs = ["cms","-D","-i", filename]
         
          let taskOutput = Process().execute("/usr/bin/security", workingDirectory: nil, arguments: securityArgs)
@@ -87,6 +90,8 @@ struct ProvisioningProfile {
                         self.teamID = applicationIdentifier.substring(to: periodIndex)
                         self.name = name
                         self.entitlements = entitlements
+                        self.developerCertificates = results["DeveloperCertificates"] as? [Data] ?? []
+                        self.teamIdentifier = (results["TeamIdentifier"] as? [String])?.first
                 } else {
                     Log.write("Error processing \(filename.lastPathComponent)")
                     return nil
